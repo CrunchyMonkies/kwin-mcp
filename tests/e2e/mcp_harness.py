@@ -55,6 +55,7 @@ EXPECTED_TOOL_NAMES: frozenset[str] = frozenset(
         "wayland_info",
         "window_close",
         "window_geometry",
+        "window_set_geometry",
     }
 )
 
