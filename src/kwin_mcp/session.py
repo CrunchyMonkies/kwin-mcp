@@ -24,21 +24,23 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kwin_mcp import dbus_service_file, progress
+from kwin_mcp.models import NO_RETENTION, AppEntry, AppLogResult, KeptPaths
 
 if TYPE_CHECKING:
     from typing import IO
 
-# Upper bound for the startup handshake. Owned AT-SPI children perform service
-# lookup and exec inside the readiness deadline, with bounded TERM/KILL rollback;
-# neither service-file I/O nor an unbounded child wait can hold the parent here.
-# The wrapper's other waits are bounded individually, but their worst cases can
-# add up past this deadline and D-Bus reply timeouts do not bound connection/auth.
-# The parent tears down the session group when this deadline expires. It also
-# covers a leader killed while descendants keep stdout open, or a partial line.
+    from kwin_mcp.models import HomeMode, Retention
+
+# Upper bound for the startup handshake. The wrapper itself is bounded: the
+# AT-SPI bus activation call gives up after 10 s (--reply-timeout) and the
+# socket wait after ~30 s, about 40 s in the worst case. This bound only covers
+# cases the wrapper cannot report: a leader killed while descendants keep
+# stdout open, or a partial line that never terminates. 60 s leaves the wrapper
+# room to report first so its FAILED diagnostics reach the caller.
 _STARTUP_READ_TIMEOUT = 60.0
 
-# KWin creates its Wayland socket early in startup but owns org.kde.KWin on the
-# session bus only once its workspace exists, which took over 2 s on a
+# KWin creates its Wayland socket early in startup but owns org.kde.KWin on
+# the session bus only once its workspace exists, which took over 2 s on a
 # loaded host. Every D-Bus consumer (EIS input, screenshots, scripting)
 # needs that name, so the wrapper waits for it before printing READY; this
 # bounds that wait.
@@ -54,9 +56,6 @@ _A11Y_STATUS_INTERFACE = "org.a11y.Status"
 # stalled bus never holds the registry lock or the server exit longer.
 _A11Y_CALL_TIMEOUT_S = 5.0
 _KWIN_BUS_NAME_TIMEOUT = 30
-# Opt-in: when the AT-SPI bus activation fails, start the launcher and the
-# registry directly from their service files' Exec= lines. Direct helpers run
-# in the server's SELinux domain by specific operator opt-in.
 ATSPI_DIRECT_START_ENV = "KWIN_MCP_ATSPI_DIRECT_START"
 
 
@@ -69,15 +68,22 @@ class SessionType(Enum):
 
 @dataclass
 class SessionConfig:
-    """Configuration for an isolated KWin session."""
+    """Configuration for an isolated KWin session.
 
-    socket_name: str = ""
+    ``home`` and ``retention`` are fixed here, at start: ``start`` registers
+    for removal exactly what ``stop`` removes, so every exit path (``stop``,
+    or the registry sweep when the server exits while a tool is busy) keeps
+    the same directories.
+    """
+
     screen_width: int = 1920
     screen_height: int = 1080
     enable_clipboard: bool = False
-    keep_screenshots: bool = False
-    isolate_home: bool = False
-    keep_home: bool = False
+    # "isolated" gives launched apps a private temporary HOME with XDG dirs;
+    # "host" keeps the host HOME (KWin still gets a temporary XDG_CONFIG_HOME).
+    home: HomeMode = "host"
+    retention: Retention = NO_RETENTION
+    socket_name: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
 
 
@@ -117,8 +123,7 @@ class SessionInfo:
     kwin_pid: int
     screenshot_dir: Path = field(default_factory=lambda: Path("/tmp"))
     home_dir: Path | None = None
-    app_pid: int | None = None
-    wrapper_pid: int | None = None
+    # Every app launched through kwin-mcp, keyed by PID, in launch order.
     apps: dict[int, AppInfo] = field(default_factory=dict)
     session_type: SessionType = SessionType.VIRTUAL
     # Degraded-but-running conditions reported by the startup wrapper, such as
@@ -229,6 +234,54 @@ def _terminate_app_groups(apps: list[AppInfo]) -> None:
     process_registry.terminate_leaders([app.process for app in apps], reap=True)
 
 
+def _app_entries(apps: dict[int, AppInfo]) -> list[AppEntry]:
+    """Report every launched app in launch order, polling through the registry.
+
+    Polling reaps an app that exited (and unregisters it in the same step), so
+    its exit code is known here; a reaped leader keeps its ``returncode``.
+    """
+    entries: list[AppEntry] = []
+    for app in apps.values():
+        exit_code = process_registry.poll(app.process)
+        entries.append(
+            AppEntry(
+                pid=app.pid,
+                command=app.command,
+                running=exit_code is None,
+                exit_code=exit_code,
+                log_path=str(app.log_path),
+            )
+        )
+    return entries
+
+
+def _read_app_log(apps: dict[int, AppInfo], pid: int, last_n_lines: int) -> AppLogResult:
+    """Read the tail of a launched app's captured stdout/stderr.
+
+    ``last_n_lines`` > 0 keeps that many trailing lines; 0 keeps every line.
+    A log that does not exist yet or is empty reads as no lines.
+    """
+    app = apps.get(pid)
+    if app is None:
+        available = list(apps.keys())
+        msg = f"No app with PID {pid}. Available PIDs: {available}"
+        raise ValueError(msg)
+    lines: list[str] = []
+    if app.log_path.exists():
+        lines = app.log_path.read_text(errors="replace").splitlines()
+    truncated = 0 < last_n_lines < len(lines)
+    if truncated:
+        lines = lines[-last_n_lines:]
+    return AppLogResult(pid=pid, log_path=str(app.log_path), lines=lines, truncated=truncated)
+
+
+def _kept_dir(path: Path | None, *, keep: bool) -> str | None:
+    """The path of a retained directory that survived the stop, else ``None``."""
+    if not keep or path is None or not path.is_dir():
+        return None
+    return str(path)
+
+
 class OwnedProcessRegistry:
     """Thread-safe registry of the process groups and temp dirs kwin-mcp owns.
 
@@ -237,9 +290,9 @@ class OwnedProcessRegistry:
     path the main thread cleans up the owned resources directly. This registry
     records, at spawn time, the process groups kwin-mcp owns — the virtual
     session's ``dbus-run-session`` wrapper group and every launched app group,
-    virtual or live — plus the temp dirs a virtual session creates that
-    ``session_stop`` would remove (an isolated home unless ``keep_home``, the
-    per-session config dir, and the screenshot dir unless ``keep_screenshots``).
+    virtual or live — plus the temp dirs a session creates that ``session_stop``
+    would remove (an isolated home unless ``retention.home``, the per-session
+    config dir, and the screenshot dir unless ``retention.artifacts``).
     KWin of a live session and any pre-existing process are never recorded, so
     they are never signalled.
 
@@ -668,8 +721,8 @@ class Session:
 
         self._socket_name = config.socket_name or f"wayland-mcp-{os.getpid()}-{int(time.time())}"
 
-        # Create isolated home directory if requested
-        if config.isolate_home:
+        # home="isolated": launched apps get a private temporary HOME.
+        if config.home == "isolated":
             self._home_dir = Path(tempfile.mkdtemp(prefix="kwin-mcp-home-"))
             for subdir in (
                 ".config",
@@ -680,9 +733,10 @@ class Session:
                 (self._home_dir / subdir).mkdir(parents=True, exist_ok=True)
             # Record the home when session_stop would remove it, so the exit path
             # (when it cannot run session_stop) mirrors session_stop's retention
-            # semantics: keep_home alone decides whether the home survives. The
-            # screenshot dir lives outside the home and follows keep_screenshots.
-            if not config.keep_home:
+            # semantics: retention.home alone decides whether the home survives.
+            # The screenshot dir lives outside the home and follows
+            # retention.artifacts.
+            if not config.retention.home:
                 process_registry.register_temp_dir(self._home_dir)
 
         # Clean up any stale socket files
@@ -708,7 +762,6 @@ class Session:
         # contain everything kwin/konsole need to start.
 
         # Build the wrapper script that runs inside dbus-run-session
-        env = self._build_env(config)
         wrapper_script = self._build_wrapper_script(config)
 
         # Start the isolated session in its own process group. stderr goes to a
@@ -727,7 +780,7 @@ class Session:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=self._stderr_file,
-                env=env,
+                env=self._build_env(config),
                 start_new_session=True,
             )
         except BaseException:
@@ -793,11 +846,11 @@ class Session:
 
         progress.report(3, progress_total, "Wayland socket ready")
         # The screenshot dir (screenshots and app logs) always lives outside the
-        # isolated home, so keep_screenshots alone decides whether it survives.
-        # A keep_screenshots session is the caller's to retain, so it is not
+        # isolated home, so retention.artifacts alone decides whether it
+        # survives. A retained dir is the caller's to keep, so it is not
         # recorded for the exit path.
         screenshot_dir = Path(tempfile.mkdtemp(prefix="kwin-mcp-screenshots-"))
-        if not config.keep_screenshots:
+        if not config.retention.artifacts:
             process_registry.register_temp_dir(screenshot_dir)
 
         self._info = SessionInfo(
@@ -870,11 +923,16 @@ class Session:
             log_path=log_path,
             process=proc,
         )
-        self._info.app_pid = proc.pid
         self._info.apps[proc.pid] = app_info
         return app_info
 
-    def read_app_log(self, pid: int, last_n_lines: int = 50) -> str:
+    def apps(self) -> list[AppEntry]:
+        """Every app launched in this session, in launch order, with its state."""
+        if self._info is None:
+            return []
+        return _app_entries(self._info.apps)
+
+    def read_app_log(self, pid: int, last_n_lines: int = 50) -> AppLogResult:
         """Read the log output of a launched app.
 
         Args:
@@ -882,26 +940,12 @@ class Session:
             last_n_lines: Number of trailing lines to return (0 = all).
 
         Returns:
-            The app's stdout/stderr output.
+            The tail of the app's stdout/stderr output.
         """
         if self._info is None:
             msg = "Session is not running"
             raise RuntimeError(msg)
-
-        app = self._info.apps.get(pid)
-        if app is None:
-            available = list(self._info.apps.keys())
-            msg = f"No app with PID {pid}. Available PIDs: {available}"
-            raise ValueError(msg)
-
-        if not app.log_path.exists():
-            return "(no log output yet)"
-
-        text = app.log_path.read_text(errors="replace")
-        if last_n_lines > 0:
-            lines = text.splitlines()
-            text = "\n".join(lines[-last_n_lines:])
-        return text or "(no log output yet)"
+        return _read_app_log(self._info.apps, pid, last_n_lines)
 
     def _terminate_apps(self) -> None:
         """Stop every launched app with its whole process group and reap the leaders."""
@@ -909,10 +953,14 @@ class Session:
             return
         _terminate_app_groups(list(self._info.apps.values()))
 
-    def stop(self) -> None:
-        """Stop the isolated session and clean up all processes."""
+    def stop(self) -> KeptPaths:
+        """Stop the isolated session and clean up all processes.
+
+        Returns the directories the session's retention kept (only those that
+        still exist).
+        """
         if self._process is None:
-            return
+            return KeptPaths()
 
         # Apps started by launch_app are children of this process, not of the
         # session's process group, so the signal below never reaches them. A
@@ -949,14 +997,16 @@ class Session:
             self._stderr_file.close()
             self._stderr_file = None
 
-        # Two independent retention rules: keep_home alone decides whether the
-        # isolated home survives, keep_screenshots alone whether the screenshot
-        # dir (screenshots and app logs, always outside the home) survives.
-        keep_home = self._config is not None and self._config.keep_home
-        keep_screenshots = self._config is not None and self._config.keep_screenshots
+        # Two independent retention rules: retention.home alone decides whether
+        # the isolated home survives, retention.artifacts alone whether the
+        # screenshot dir (screenshots and app logs, always outside the home)
+        # survives.
+        retention = NO_RETENTION if self._config is None else self._config.retention
+        keep_home = retention.home
+        keep_artifacts = retention.artifacts
         if self._home_dir is not None and not keep_home:
             _remove_tree(self._home_dir)
-        if not keep_screenshots and self._info is not None:
+        if not keep_artifacts and self._info is not None:
             shutil.rmtree(self._info.screenshot_dir, ignore_errors=True)
 
         # Clean up socket files
@@ -976,20 +1026,26 @@ class Session:
         # re-removes a dir the caller asked to keep. The owned process groups
         # (the wrapper and the launched apps) are unregistered as they are
         # reaped above, so they need no explicit drop here.
-        if self._info is not None and not keep_screenshots:
+        if self._info is not None and not keep_artifacts:
             process_registry.unregister_temp_dir(self._info.screenshot_dir)
         if self._home_dir is not None and not keep_home:
             process_registry.unregister_temp_dir(self._home_dir)
 
+        screenshot_dir = None if self._info is None else self._info.screenshot_dir
+        kept = KeptPaths(
+            artifacts_dir=_kept_dir(screenshot_dir, keep=keep_artifacts),
+            home_dir=_kept_dir(self._home_dir, keep=keep_home),
+        )
         self._process = None
         self._info = None
         self._home_dir = None
+        return kept
 
     def _cleanup_start_dirs(self) -> None:
         """Release the directories created by start() when no session exists.
 
         Only used on the Popen-failure path, where _process is None and stop()
-        cannot run; the home follows keep_home as in stop(). The screenshot dir
+        cannot run; the home follows retention.home as in stop(). The screenshot dir
         is created only after KWin starts, so it does not exist yet here.
         """
         if self._session_config_dir is not None:
@@ -998,7 +1054,7 @@ class Session:
             self._session_config_dir = None
         if self._home_dir is None:
             return
-        if self._config is None or not self._config.keep_home:
+        if self._config is None or not self._config.retention.home:
             with contextlib.suppress(OSError):
                 _remove_tree(self._home_dir)
                 process_registry.unregister_temp_dir(self._home_dir)
@@ -1530,7 +1586,15 @@ class LiveSession:
         dbus_address: str,
         wayland_socket: str,
         screenshot_dir: Path,
+        retention: Retention = NO_RETENTION,
     ) -> None:
+        """Attach to a running KWin.
+
+        ``retention`` is decided here, at connect: only ``retention.artifacts``
+        applies (a live session has no isolated home). The caller registers
+        ``screenshot_dir`` with ``process_registry`` unless it is retained, so
+        the exit path keeps exactly what ``stop`` keeps.
+        """
         self._info = SessionInfo(
             dbus_address=dbus_address,
             wayland_socket=wayland_socket,
@@ -1540,7 +1604,7 @@ class LiveSession:
         )
         self._running = True
         self._app_counter: int = 0
-        self._keep_screenshots: bool = False
+        self._retention = retention
 
     @property
     def is_running(self) -> bool:
@@ -1613,36 +1677,29 @@ class LiveSession:
             log_path=log_path,
             process=proc,
         )
-        self._info.app_pid = proc.pid
         self._info.apps[proc.pid] = app_info
         return app_info
 
-    def read_app_log(self, pid: int, last_n_lines: int = 50) -> str:
-        """Read the log output of a launched app."""
-        app = self._info.apps.get(pid)
-        if app is None:
-            available = list(self._info.apps.keys())
-            msg = f"No app with PID {pid}. Available PIDs: {available}"
-            raise ValueError(msg)
+    def apps(self) -> list[AppEntry]:
+        """Every app launched through this connection, in launch order, with its state."""
+        return _app_entries(self._info.apps)
 
-        if not app.log_path.exists():
-            return "(no log output yet)"
+    def read_app_log(self, pid: int, last_n_lines: int = 50) -> AppLogResult:
+        """Read the log output of a launched app (``last_n_lines`` 0 = all)."""
+        return _read_app_log(self._info.apps, pid, last_n_lines)
 
-        text = app.log_path.read_text(errors="replace")
-        if last_n_lines > 0:
-            lines = text.splitlines()
-            text = "\n".join(lines[-last_n_lines:])
-        return text or "(no log output yet)"
-
-    def stop(self, *, keep_screenshots: bool = False) -> None:
+    def stop(self, *, retention: Retention | None = None) -> KeptPaths:
         """Disconnect from the live session.
 
-        Only cleans up screenshot directory. Does NOT kill KWin or any apps
-        that were already running before the connection.
+        Only cleans up the screenshot directory. Does NOT kill KWin or any apps
+        that were already running before the connection. ``retention``
+        defaults to the one given at connect; ``retention.home`` does not apply.
+        Returns the kept artifacts dir (only if it still exists).
         """
         if not self._running:
-            return
+            return KeptPaths()
         self._running = False
+        keep_artifacts = (self._retention if retention is None else retention).artifacts
 
         # Stop every app we launched, with its whole process group, escalating
         # SIGTERM to SIGKILL. KWin and any apps that predate the connection are
@@ -1653,10 +1710,11 @@ class LiveSession:
         # A no-op unless this connection switched accessibility on.
         process_registry.restore_accessibility(self._info.dbus_address)
 
-        # Remove the live session's screenshot dir (registered at connect when
-        # keep_screenshots is False), mirroring the registry's retention
-        # semantics. KWin of the live session was never recorded, so it is
-        # never touched here.
-        if not keep_screenshots:
+        # Remove the live session's screenshot dir (registered at connect unless
+        # retention.artifacts), mirroring the registry's retention semantics.
+        # KWin of the live session was never recorded, so it is never touched
+        # here.
+        if not keep_artifacts:
             shutil.rmtree(self._info.screenshot_dir, ignore_errors=True)
             process_registry.unregister_temp_dir(self._info.screenshot_dir)
+        return KeptPaths(artifacts_dir=_kept_dir(self._info.screenshot_dir, keep=keep_artifacts))

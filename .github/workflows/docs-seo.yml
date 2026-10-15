@@ -1,9 +1,6 @@
 name: Docs & SEO Review
 
-# Triggers whenever source code or project metadata changes, so the docs-seo
-# agent has a chance to evaluate whether documentation needs updating.
-# This workflow intentionally runs on every push / PR — it exits cleanly (no-op)
-# when the detected changes do not warrant a documentation review.
+# Validates documentation SEO keywords, tool counts, and plugin manifest / SKILL sync on pull requests.
 on:
   pull_request:
     paths:
@@ -12,7 +9,8 @@ on:
       - "CHANGELOG.md"
       - "README.md"
       - "ROADMAP.md"
-      - ".claude/positioning.yml"
+      - "CLAUDE.md"
+      - "CONTRIBUTING.md"
       - "integrations/**"
       - ".claude-plugin/**"
       - "scripts/sync_plugin_version.py"
@@ -22,7 +20,6 @@ jobs:
     name: Documentation consistency check
     runs-on: ubuntu-26.04
     permissions:
-      pull-requests: write  # needed to post PR comments
       contents: read
 
     steps:
@@ -65,70 +62,8 @@ jobs:
 
       - name: Run docs-seo consistency checks
         if: steps.changed.outputs.has_changes == 'true'
-        id: check
-        run: |
-          python3 scripts/check_docs_seo.py 2>&1 | tee /tmp/docs-seo-report.txt
-          echo "report<<EOF" >> "$GITHUB_OUTPUT"
-          cat /tmp/docs-seo-report.txt >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+        run: python3 scripts/check_docs_seo.py
 
       - name: Run plugin version + SKILL sync check
-        if: steps.changed.outputs.has_changes == 'true'
+        if: ${{ !cancelled() && steps.changed.outputs.has_changes == 'true' }}
         run: python3 scripts/sync_plugin_version.py --check
-
-      - name: Post PR comment with docs-seo findings
-        # Fork PRs get a read-only GITHUB_TOKEN, so createComment returns 403;
-        # the findings are still in the job log via tee above.
-        if: >
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name == github.repository &&
-          steps.changed.outputs.has_changes == 'true'
-        uses: actions/github-script@v9
-        with:
-          script: |
-            const report = `${{ steps.check.outputs.report }}`;
-            const changedFiles = `${{ steps.changed.outputs.changed_files }}`;
-
-            const body = [
-              '## 📝 Docs & SEO Review',
-              '',
-              '**Source files changed in this PR:**',
-              '```',
-              changedFiles,
-              '```',
-              '',
-              '**Consistency check results:**',
-              '```',
-              report,
-              '```',
-              '',
-              '> Run `@docs-seo` in Claude Code to perform a full documentation review.',
-            ].join('\n');
-
-            // Find and update existing comment, or create a new one
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-
-            const existing = comments.find(c =>
-              c.user.login === 'github-actions[bot]' &&
-              c.body.includes('Docs & SEO Review')
-            );
-
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }

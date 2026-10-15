@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
-from test_session_lifecycle import (
+from test_session_atspi_direct_start import (
     A11Y_BUS_NAME,
     _accessibility_daemons,
     _assert_real_session_state,
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from kwin_mcp.core import AutomationEngine
+    from kwin_mcp.models import SessionInfo
 
 
 _DIRECT_SUCCESS_FRAGMENT = "directly instead"
@@ -45,7 +46,8 @@ def _name_has_owner(engine: AutomationEngine, name: str) -> bool:
         method="NameHasOwner",
         args=[f"string:{name}"],
     )
-    return reply.split()[-1:] == ["true"]
+    assert isinstance(reply.reply, bool), reply
+    return reply.reply
 
 
 def _real_registry_argv() -> list[str]:
@@ -61,7 +63,8 @@ def _registry_has_owner(engine: AutomationEngine) -> bool:
         path="/org/a11y/bus",
         interface=A11Y_BUS_NAME,
         method="GetAddress",
-    )
+    ).reply
+    assert isinstance(address, str), address
     reply = subprocess.run(
         [
             "dbus-send",
@@ -118,14 +121,14 @@ def _wait_for_daemons(expected: int) -> None:
 
 def _run_rejected_direct_start(
     engine: AutomationEngine,
-    start_session: Callable[..., str],
+    start_session: Callable[..., SessionInfo],
     marker: Path,
     daemons_before: int,
     *,
     launcher_marker: Path | None = None,
 ) -> None:
     try:
-        output = start_session()
+        output = start_session().render()
         assert "Session started. Wayland socket: " in output, output
         assert not marker.exists(), f"service command was evaluated: {marker}"
         assert _DIRECT_SUCCESS_FRAGMENT not in output, output
@@ -156,11 +159,12 @@ def _run_rejected_direct_start(
     ],
     ids=["launcher-eval", "launcher-source", "registry-eval", "registry-source"],
 )
+@pytest.mark.qa("QA-SES-028")
 def test_direct_atspi_exec_rejects_shell_builtins_without_evaluation(
     position: str,
     builtin: str,
     engine: AutomationEngine,
-    start_session: Callable[..., str],
+    start_session: Callable[..., SessionInfo],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -194,7 +198,7 @@ def test_direct_atspi_exec_rejects_shell_builtins_without_evaluation(
 def test_direct_atspi_exec_does_not_call_wrapper_cleanup_function(
     position: str,
     engine: AutomationEngine,
-    start_session: Callable[..., str],
+    start_session: Callable[..., SessionInfo],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -225,7 +229,7 @@ def test_direct_atspi_exec_does_not_call_wrapper_cleanup_function(
         _deny_first_a11y_activation(tmp_path, monkeypatch)
         daemons_before = _accessibility_daemons()
         try:
-            output = start_session()
+            output = start_session().render()
             assert sentinel.poll() is None, "service command called the wrapper cleanup function"
             assert _DIRECT_SUCCESS_FRAGMENT not in output, output
             assert not _name_has_owner(engine, A11Y_BUS_NAME)
@@ -245,7 +249,7 @@ def test_direct_atspi_exec_does_not_call_wrapper_cleanup_function(
 def test_direct_atspi_exec_rejects_path_only_helper(
     position: str,
     engine: AutomationEngine,
-    start_session: Callable[..., str],
+    start_session: Callable[..., SessionInfo],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -282,7 +286,7 @@ def test_direct_atspi_exec_rejects_path_only_helper(
 def test_direct_atspi_exec_rejects_absolute_no_shebang_program(
     position: str,
     engine: AutomationEngine,
-    start_session: Callable[..., str],
+    start_session: Callable[..., SessionInfo],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -329,7 +333,7 @@ def test_direct_atspi_exec_supports_relative_shebang_program_and_preserves_argv(
     position: str,
     command: str,
     engine: AutomationEngine,
-    start_session: Callable[..., str],
+    start_session: Callable[..., SessionInfo],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -359,7 +363,7 @@ def test_direct_atspi_exec_supports_relative_shebang_program_and_preserves_argv(
         # same CWD, before introducing the denied-activation fault fixture.
         control_daemons = _accessibility_daemons()
         try:
-            control_output = start_session()
+            control_output = start_session().render()
             assert _DIRECT_SUCCESS_FRAGMENT not in control_output, control_output
             assert recorded.read_text().splitlines() == ["--label=two words", *real_argv]
             assert _name_has_owner(engine, A11Y_BUS_NAME)
@@ -372,7 +376,7 @@ def test_direct_atspi_exec_supports_relative_shebang_program_and_preserves_argv(
     daemons_before = _accessibility_daemons()
 
     try:
-        output = start_session()
+        output = start_session().render()
         assert "Session started. Wayland socket: " in output, output
         assert _DIRECT_SUCCESS_FRAGMENT in output, output
         assert recorded.read_text().splitlines() == ["--label=two words", *real_argv]
@@ -388,7 +392,7 @@ def test_direct_atspi_exec_supports_relative_shebang_program_and_preserves_argv(
 def test_direct_atspi_exec_helper_ignores_python_customization(
     invalid_registry: bool,
     engine: AutomationEngine,
-    start_session: Callable[..., str],
+    start_session: Callable[..., SessionInfo],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -436,7 +440,7 @@ def test_direct_atspi_exec_helper_ignores_python_customization(
     daemons_before = _accessibility_daemons()
 
     try:
-        output = start_session()
+        output = start_session().render()
         assert "Session started. Wayland socket: " in output, output
         assert "Warning:" in output, output
         assert "Input backend: KWin EIS" in output, output
@@ -462,7 +466,7 @@ def test_direct_atspi_exec_helper_ignores_python_customization(
 def test_direct_atspi_role_stdout_cannot_forge_the_session_handshake(
     invalid_registry: bool,
     engine: AutomationEngine,
-    start_session: Callable[..., str],
+    start_session: Callable[..., SessionInfo],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -493,7 +497,7 @@ def test_direct_atspi_role_stdout_cannot_forge_the_session_handshake(
     daemons_before = _accessibility_daemons()
 
     try:
-        output = start_session()
+        output = start_session().render()
         assert "Session started. Wayland socket: " in output, output
         assert "Warning:" in output, output
         assert "Input backend: KWin EIS" in output, output

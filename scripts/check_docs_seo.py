@@ -7,11 +7,9 @@ Validates two scopes:
    present across README.md, CLAUDE.md, ROADMAP.md, CONTRIBUTING.md, pyproject.toml.
 
 2) Plugin & integrations sync — that integrations/* plugin manifests carry the
-   required keyword subset (per .claude/positioning.yml drift_detection),
-   that the Claude Code source SKILL.md and OpenCode plugin's bundled
-   SKILL.md remain byte-identical, and that the canonical tool count is
-   reflected consistently across all locations.
-
+   required keyword subset, that the Claude Code source SKILL.md and OpenCode
+   plugin's bundled SKILL.md remain byte-identical, and that the canonical tool
+   count is reflected consistently across all locations.
 Exit code:
     0  — all checks passed (no-op)
     1  — one or more checks failed (documentation/plugin may need updating)
@@ -76,18 +74,8 @@ REQUIRED_TERMS: list[tuple[str, list[str]]] = [
     ),
 ]
 
-DOCS_SEO_AGENT = ".claude/agents/docs-seo.md"
-DOCS_SEO_REQUIRED: list[str] = [
-    "live desktop automation",
-    "live session",
-    "session_connect",
-]
-
 # ---------------------------------------------------------------------------
 # Plugin & integrations sync
-# Canonical source of truth: .claude/positioning.yml § drift_detection.
-# When manifest_version in positioning.yml is bumped, the docs-seo agent's
-# manifest-update trigger is responsible for keeping these constants synced.
 # ---------------------------------------------------------------------------
 
 PLUGIN_MANIFEST_REQUIRED_KEYWORDS: list[str] = [
@@ -116,8 +104,23 @@ SKILL_MIRRORS: list[str] = [
     "integrations/opencode/plugin/skill/kwin-desktop-automation/SKILL.md",
 ]
 
-TOOL_COUNT_CANONICAL = 37
+TOOL_COUNT_CANONICAL = 29
 SERVER_PY = "src/kwin_mcp/server.py"
+
+# Files that state the tool count, with the phrase each must contain. Every other
+# count phrase in them ("<N> MCP tools", "<N> capabilities", "all <N> tools",
+# "tool_count: <N>") must name TOOL_COUNT_CANONICAL too.
+TOOL_COUNT_REFERENCES: list[tuple[str, str]] = [
+    ("README.md", f"{TOOL_COUNT_CANONICAL} MCP tools"),
+    ("CONTRIBUTING.md", f"all {TOOL_COUNT_CANONICAL} tools"),
+    ("integrations/claude-code/.claude-plugin/plugin.json", f"{TOOL_COUNT_CANONICAL} MCP tools"),
+    (SKILL_SOURCE, f"{TOOL_COUNT_CANONICAL} capabilities"),
+]
+TOOL_COUNT_PHRASE = re.compile(
+    r"\b(\d+) (?:MCP tools|capabilities)\b"
+    r"|\ball (\d+) (?:registered )?tools\b"
+    r"|\btool_count(?:_canonical)?: (\d+)\b"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -283,12 +286,33 @@ def check_tool_count() -> CheckResult:
         result.missing = [
             f"server.py has {actual} @_tool(...) functions"
             f" but TOOL_COUNT_CANONICAL = {TOOL_COUNT_CANONICAL};"
-            f" update .claude/positioning.yml § drift_detection.tool_count_canonical,"
-            f" check_docs_seo.py § TOOL_COUNT_CANONICAL, README.md tool tables,"
+            f" update check_docs_seo.py § TOOL_COUNT_CANONICAL, README.md tool tables,"
             f" and integrations/claude-code/skills/kwin-desktop-automation/SKILL.md"
             f" '{TOOL_COUNT_CANONICAL} capabilities' references"
         ]
     return result
+
+
+def check_tool_count_references() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    for rel_path, required in TOOL_COUNT_REFERENCES:
+        result = CheckResult(file=f"{rel_path} (tool count)")
+        path = ROOT / rel_path
+        if not path.exists():
+            result.missing = [f"<file not found: {rel_path}>"]
+            results.append(result)
+            continue
+        content = path.read_text(encoding="utf-8")
+        if required not in content:
+            result.missing.append(f"'{required}' is not stated")
+        for match in TOOL_COUNT_PHRASE.finditer(content):
+            count = int(next(group for group in match.groups() if group is not None))
+            if count != TOOL_COUNT_CANONICAL:
+                result.missing.append(
+                    f"stale count '{match.group(0)}' (canonical is {TOOL_COUNT_CANONICAL})"
+                )
+        results.append(result)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -306,11 +330,10 @@ def main() -> int:
         else:
             results.append(check_file(rel_path, required))
 
-    results.append(check_file(DOCS_SEO_AGENT, DOCS_SEO_REQUIRED))
-
     results.extend(check_plugin_keywords_sync())
     results.extend(check_skill_identical())
     results.append(check_tool_count())
+    results.extend(check_tool_count_references())
 
     failed = [r for r in results if not r.ok]
     if not failed:
@@ -324,8 +347,10 @@ def main() -> int:
             print(f"    - {term}")
 
     print("\nFix path:")
-    print("  • For documentation drift: run the @docs-seo agent in Claude Code.")
-    print("  • For plugin manifest version/SKILL drift: `python3 scripts/sync_plugin_version.py`.")
+    print(
+        "  • Update the affected documentation files or run "
+        "`python3 scripts/sync_plugin_version.py`."
+    )
     return 1
 
 

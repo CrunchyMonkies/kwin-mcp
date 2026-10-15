@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from test_session_lifecycle import (
+from test_session_atspi_direct_start import (
     _assert_real_session_state,
     _bus_name_has_owner,
     _deny_first_a11y_activation,
@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from kwin_mcp.core import AutomationEngine
+    from kwin_mcp.models import SessionInfo
 
 _SERVICE_NAME = "org.a11y.Bus"
 _SERVICE_LIMIT = 128 * 1024
@@ -278,7 +279,7 @@ def test_unsearchable_data_root_does_not_prevent_healthy_accessibility_bus_activ
             SessionConfig(
                 screen_width=screen_size[0],
                 screen_height=screen_size[1],
-                isolate_home=True,
+                home="isolated",
             )
         )
         assert info.startup_warnings == []
@@ -603,7 +604,7 @@ def test_direct_atspi_child_fails_closed_before_a_later_real_launcher(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     engine: AutomationEngine,
-    start_session: Callable[..., str],
+    start_session: Callable[..., SessionInfo],
     kind: str,
 ) -> None:
     """Real Session startup stays usable, but the child must not bypass a denied first root."""
@@ -618,7 +619,7 @@ def test_direct_atspi_child_fails_closed_before_a_later_real_launcher(
     (later_root / "dbus-1/accessibility-services/org.a11y.atspi.Registry.service").write_text(
         _real_service_file("accessibility-services/org.a11y.atspi.Registry.service")
     )
-    # Engine.session_start(env=...) is app-only; operator roots must reach Session._build_env.
+    # App environment belongs to app_launch; operator roots must reach Session._build_env.
     monkeypatch.setenv(
         "XDG_DATA_DIRS",
         _environment(first_root, later_root, Path("/usr/local/share"), Path("/usr/share"))[
@@ -638,7 +639,7 @@ def test_direct_atspi_child_fails_closed_before_a_later_real_launcher(
             else:
                 first_path.stat()
         assert denied.value.errno == errno.EACCES
-        output = start_session()
+        output = start_session().render()
         assert "Session started. Wayland socket: " in output, output
         assert "Warning:" in output, output
         assert "started the accessibility bus and registry directly" not in output, output
@@ -662,7 +663,7 @@ def test_direct_atspi_child_skips_a_fifo_for_a_later_launcher_recorder(tmp_path:
     # dbus-file-unix.c open(O_RDONLY | O_BINARY) can block on this writerless FIFO before fstat.
     # The Session startup failure therefore never reaches our helper. Run the exact private
     # -I -S launcher role below; the real-Session permission and ownership cases stay above
-    # and in test_session_lifecycle.py. This does not claim all D-Bus versions scan identically.
+    # and in test_session_atspi_direct_start.py. Not all D-Bus versions scan identically.
     first_root = tmp_path / "fifo-first"
     first_path = _service_path(first_root)
     first_path.parent.mkdir(parents=True)
