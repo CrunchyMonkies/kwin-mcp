@@ -80,6 +80,44 @@ jobs:
           name: dist
           path: dist/
 
+  opencode-plugin:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: "24"
+      - name: Install plugin dependencies
+        working-directory: integrations/opencode/plugin
+        run: npm install --no-audit --no-fund
+      - name: Build plugin
+        working-directory: integrations/opencode/plugin
+        run: npm run build
+      - name: Type-check plugin
+        working-directory: integrations/opencode/plugin
+        run: npm run typecheck
+      - name: Check plugin contract
+        working-directory: integrations/opencode/plugin
+        run: npm run test:contract
+      - name: Pack plugin artifact
+        id: pack
+        working-directory: integrations/opencode/plugin
+        run: |
+          artifact_dir="$RUNNER_TEMP/kwin-mcp-plugin-artifact"
+          mkdir -p "$artifact_dir"
+          npm pack --json --pack-destination "$artifact_dir" >"$artifact_dir/pack.json"
+          artifact_name="$(node -e '
+            const { readFileSync } = require("node:fs");
+            process.stdout.write(JSON.parse(readFileSync(process.argv[1], "utf8"))[0].filename);
+          ' "$artifact_dir/pack.json")"
+          rm "$artifact_dir/pack.json"
+          echo "path=$artifact_dir/$artifact_name" >> "$GITHUB_OUTPUT"
+      - name: Smoke-test packed plugin with OpenCode V2 server
+        env:
+          PACKED_ARTIFACT: ${{ steps.pack.outputs.path }}
+        working-directory: integrations/opencode/plugin
+        run: node test/opencode-smoke.mjs "$PACKED_ARTIFACT"
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [lint, type-check, build, unit]

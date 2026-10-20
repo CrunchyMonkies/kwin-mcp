@@ -9,8 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- E2E CI now builds each distro-and-architecture image once per workflow run, shares a compressed image artifact with that row's five test shards, and validates seven row-specific required checks instead of rebuilding the same image in every shard. Image, diagnostic, and status artifacts include the workflow attempt, so a full workflow rerun rebuilds and validates a matching set.
+- E2E CI shares stable, same-run image and shard-status artifacts across partial reruns. Each row checks its latest build and shard job results before validating coverage, so an older success cannot hide a newer failure. Diagnostic archives remain attempt-specific.
+- The OpenCode integration uses the V2 `Plugin.define` and `plugins` configuration to register the `kwin-mcp` MCP server and bundled `kwin-desktop-automation` skill automatically while preserving existing user entries. OpenCode V1 is unsupported.
 - E2E row aggregation now checks only its own five shard statuses and collected/full test counts, so an unrelated row failure no longer causes a false failure in a healthy row.
+- E2E CI detects the installed KWin version and passes `/dev/udmabuf` read/write with its matching host group to actual KWin 6.8 and later test containers; quality and collection containers remain device-free.
+- Visual QA keeps Xvfb/scrot on KWin 6.3 and 6.7 and uses private `--virtual` ScreenShot2 capture on KWin 6.8 and later, with an automatically enabled exact-backend probe and an independent Spectacle PNG comparison at scale 1. Existing semantic pixel, cursor, scaling, crop, retention, and mapping-failure checks remain, and the slow physical-X11 cases stay on the Debian lane.
+- Native provider-unavailable checks unload the real screenshot plugin through `org.kde.KWin /Plugins`, verify capture failure without a PNG, then reload the plugin and verify provider recovery.
+- Native visual-test sessions unset `DISPLAY` instead of passing an empty value, so AT-SPI starts without an X server; legacy Xvfb sessions keep their allocated display.
+- GTK interaction-probe test-fixture status labels keep a stable width as event text changes, preserving CLI/engine coordinate comparisons.
 
 ## [1.0.0] - 2026-10-15
 

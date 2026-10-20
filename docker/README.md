@@ -68,17 +68,19 @@ scripts/run-e2e-docker.sh
               |           +-- AutomationEngine and the virtual or connected session
               |
               +-- visual tests
-                    |-- Xvfb inside the container
+                    |-- KWin 6.3/6.7: Xvfb inside the container
                     +-- dbus-run-session
                           |-- AT-SPI2 bus
-                          +-- nested kwin_wayland --x11-display ...
+                          +-- test-owned kwin_wayland
+                                |-- KWin 6.3/6.7: --x11-display + X11/scrot capture
+                                |-- KWin >=6.8: --virtual + ScreenShot2 capture
+                                |               + independent Spectacle PNG observer
                                 |-- Wayland applications
                                 +-- installed `kwin-mcp` via session_connect
-                                      +-- explicit X11/scrot pixel capture
-                                          (output scale set by kscreen-doctor)
+                                    (output scale set by kscreen-doctor)
 ```
 
-The virtual and nested compositors use Mesa llvmpipe software rendering. The container requires no `--privileged`, `--cap-add`, `/dev/dri`, GPU, or other device flags. Xvfb is installed and started inside the container only for nested visual tests; the Docker host does not need an X server.
+The compositors use Mesa llvmpipe software rendering. KWin 6.8 and later require `/dev/udmabuf` for the virtual software-render device. CI detects the installed KWin version and passes that host character device read/write, plus its matching host group for UID 1000, only to actual test containers that require it; quality and collect-only containers remain device-free. Local runs need equivalent access on KWin 6.8 and later. No `--privileged`, `--cap-add`, physical GPU, or `/dev/dri` passthrough is required. Legacy visual tests start Xvfb inside the container, so the host does not need an X server. Newer visual tests use the private virtual compositor because Xvfb does not provide the DRI3 support that KWin 6.8 needs for `--x11-display`.
 
 ## Commands
 
@@ -157,7 +159,7 @@ The suite is organized by tool: one file per 1.0 tool for engine-level behavior,
 | `test_session_stop.py` | `session_stop`: `kind`/`kept`/`released`; stop without a session is `stopped: false`, not an error; held buttons and keys released and reported; a live stop kills only launched apps and restores the accessibility switch. |
 | `test_session_info.py` | `session_info`: `null` without a session; launched apps with pid, command, running state, exit code and log path; held input reported after revalidation. |
 | `test_app_launch_log.py` | `app_launch`/`app_log`: a failed launch keeps the session and names `session_stop`; `env` reaches only the launched process; virtual `DISPLAY` stripped, live kept; tail, `0` = whole log, unknown pid, empty log; the log URI matches the resource. |
-| `test_screen_capture.py`, `test_screen_capture_visual.py` | `screen_capture`: `Frame` fields, `region` inside/outside/partial, `max_edge` `0`/null/server default, virtual-backend failure as a tool error with the server surviving; pixel oracles at output scales 1.0 and 1.45 in the nested X11/scrot fixture. |
+| `test_screen_capture.py`, `test_screen_capture_visual.py` | `screen_capture`: `Frame` fields, `region` inside/outside/partial, `max_edge` `0`/null/server default, provider-unavailable errors with the server surviving; pixel oracles at output scales 1.0 and 1.45 through the version-selected visual backend. |
 | `test_element_query.py` | `element_query`: empty-locator and filtered headers, case-sensitive states, `max_depth` `0`, childless applications, `window_id`, `wait` present/absent/timeout/`timeout_ms=0`, scrollbar values. |
 | `test_element_refs.py` | Ref generation prefix, stale refs after a worker restart, role change rejected, `rect: null` target refused with the reason, `{ref, dx, dy}` hitting the neighbour. |
 | `test_element_act.py` | `element_act` by ref and by strict locator (depth 64, fail-closed), exact/spoken name matching, ordered fallback actions, zero candidates listing actions, `confirmed`/`sent_unconfirmed`, app-reported failure, `capture` after the action. |
@@ -183,7 +185,7 @@ The suite is organized by tool: one file per 1.0 tool for engine-level behavior,
 | `test_unicode_clipboard_lifecycle.py` | Unicode clipboard paste: byte-for-byte restoration of every prior MIME type, empty prior selections, the secret hint, a concurrent user copy that must survive, a stalled prior owner, a single restore owner, survival across a live-session disconnect. |
 | `test_clipboard_helper_protocol.py` | The private `kwin_mcp.clipboard` helper driven directly against a test-owned KWin over data-control: READY timeout, framing errors, and restoring the prior selection. |
 | `test_spectacle_composition.py` | Spectacle fallback decisions for synthetic KWin topologies (#67): refused layouts before Spectacle starts on affected versions; controls that still capture. |
-| `test_virtual_session_smoke.py` | The virtual-session smoke run, including the exact-virtual ScreenShot2 success probe `test_screen_capture_exact_virtual_backend` (skipped with its reason, see below) and the error path of that backend. |
+| `test_virtual_session_smoke.py` | The virtual-session smoke run, including the exact-virtual ScreenShot2 success probe `test_screen_capture_exact_virtual_backend` (automatically enabled on KWin 6.8 and later; legacy opt-in on KWin 6.3 and 6.7) and provider-unavailable errors. |
 | `test_session_accessibility_switch.py` | The `org.a11y.Status.IsEnabled` switch: on in virtual sessions; reported, left off by default, enabled by `enable_accessibility=true`, and restored at `session_stop` and on a server exit, including one that lands while a tool runs. |
 | `test_atspi_worker.py` | The long-lived AT-SPI2 worker: answers from the current bus after a replaced session, respawn of a killed worker, reaping of a stopped worker, no helper left after `session_stop`. |
 | `test_session_atspi_direct_start.py` | Exact server-environment opt-in, activation-denial warnings, `XDG_DATA_DIRS`, missing/invalid services, stalled-helper rollback, and direct-start cleanup. |
@@ -252,6 +254,10 @@ Visual tests do not infer success from process exit alone. They preserve PNGs an
 
 The screen-capture visual tests also drive frame-producing pointer, keyboard, touch, and drag tools through installed MCP stdio.
 
+The native scale-1 exact-backend probe compares the product PNG's RGB pixels with an independent `/usr/bin/spectacle` PNG. Fractional-scale tests check logical geometry and pixel behavior without assuming that Spectacle's device-pixel grid equals ScreenShot2's logical grid. Both visual backends retain crop, retention, and coordinate-mapping failure checks.
+
+The physical-X11 transparent-gap, output-window-resize, and mid-burst scale-change cases (QA-CAP-009 and QA-CAP-016) keep their existing setup and assertions in the Debian 6.3 amd64/arm64 slow lane.
+
 ## Evidence layout
 
 The local runner creates one directory per invocation:
@@ -298,24 +304,29 @@ CI stores shard evidence under `artifacts/e2e/<label>-s<N>/` and uploads one dia
 
 The Arch Linux image has no arm64 row because no current Arch-family arm64 base image exists.
 
-CI builds one image for each row once per workflow run, exports it as a compressed artifact, and
-shares it with that row's five test shards. The 35 shards feed seven independent required checks,
-one per row. Each check reads only its own five status files and requires every shard to succeed
-and the collected test count to equal the full collection count. A failure in another row does
-not change that result. The shard command keeps the `not slow` selection, strict skip handling,
-layer-shell requirement, and existing timeouts. Image artifacts are retained for one day; diagnostic
-and status artifacts keep the repository's default retention.
+CI builds one image for each row and shares it with that row's five test shards. The 35 shards
+feed seven independent required checks, one per row. Each check first verifies through the
+current workflow run's latest jobs API that its row's build and all five shard jobs completed
+successfully, then reads its five status files and requires their summed test count to equal
+the full collection count. A failure in another row does not change that result. The shard
+command keeps the `not slow` selection, strict skip handling, layer-shell requirement, and
+existing timeouts. Image artifacts are retained for one day; diagnostic and status artifacts
+keep the repository's default retention.
 
-Artifacts are namespaced by workflow attempt. Rerun the whole workflow to rebuild each image and
-produce a matching set of five shard statuses; an individual job rerun does not reuse artifacts
-from another attempt.
+Image artifacts use stable same-run names `e2e-image-LABEL`; status artifacts use
+`e2e-status-LABEL-sN`. Reruns overwrite these artifacts, allowing partial reruns to reuse
+successful jobs from the same workflow run. Diagnostic archives remain attempt-specific.
+Checking the latest row job states before reading statuses prevents an older success from
+masking a newer failed, missing, or cancelled job.
 
 One test, the missing-command case of `test_app_launch_log.py`, fails only when the container runs on an emulated kernel such as an arm64 Docker host: qemu-user lets `execve` of a missing file report as exit 127 in the child instead of raising `FileNotFoundError`, so `app_launch` reports a launched process that immediately died. On a native amd64 runner the assertion holds.
 
-## Screenshot backends and exact-virtual limitation
+## Screenshot backends and virtual/nested limitations
 
-ScreenShot2 and Spectacle remain the normal Wayland screenshot backends. The nested visual fixture explicitly sets `KWIN_MCP_X11_SCREENSHOT=1` and supplies its Xvfb `DISPLAY`, selecting the test-only X11/scrot path so pixel assertions do not depend on KWin's exact virtual screenshot behavior. That path finds each KWin output's X window with `xwininfo` and rescales it to logical pixels, and it mirrors the EIS pointer to the matching physical X position so cursor captures line up. For fractional-scale tests, the fixture sets every nested output's scale through `kscreen-doctor` (package `libkscreen-bin`) and waits until KWin reports it; the command and its output are kept in `kscreen-doctor.log` in the visual artifact directory.
+ScreenShot2 and Spectacle are the normal Wayland screenshot backends. On KWin 6.3 and 6.7, the visual fixture keeps the nested Xvfb compositor, sets `KWIN_MCP_X11_SCREENSHOT=1`, and supplies its Xvfb `DISPLAY` to select X11/scrot capture. That path finds each KWin output's X window with `xwininfo`, rescales it to logical pixels, and mirrors the EIS pointer to the matching physical X position for cursor captures. On KWin 6.8 and later, the fixture starts a private `kwin_wayland --virtual` compositor with `/dev/udmabuf` and its host group, disables inherited X11 capture forcing, and selects ScreenShot2. It requires a real ScreenShot2 provider and Spectacle PNG during startup; the semantic pixel assertions and scale-1 independent PNG comparison test correctness separately.
 
-KWin's `kwin_wayland --virtual` backend in this image does not return ScreenShot2 capture data. The exact-virtual success probe `test_virtual_session_smoke.py::test_screen_capture_exact_virtual_backend` therefore remains skipped in normal runs; setting `KWIN_MCP_E2E_SCREENSHOT=1` only re-enables that exact-backend probe and is not the supported visual-test path. The suite still verifies that ScreenShot2/Spectacle failures become actionable tool errors without killing the engine or installed MCP server. Because the image's Spectacle refuses the headless compositor immediately, the Spectacle fallback is covered with a `spectacle` stub placed first on the server's `PATH`. A stub that answers after 12 seconds, beyond the former fixed 10-second bound, must yield one full logical-space screenshot. A stub that never answers must fail at the deadline the error reports. A stub that exits 0 without writing a file must have its stderr reason included in the error.
+The KWin 6.3 and 6.7 exact-virtual ScreenShot2 probe remains opt-in because those virtual backends do not return capture data in these images. KWin 6.8 and later automatically opt into the probe and fail clearly if `/dev/udmabuf` cannot be opened read/write. The fixture does not silently fall back to Xvfb. For fractional-scale tests, both backends set each output's scale through `kscreen-doctor` and wait until KWin reports it; `kscreen-doctor.log` preserves the command and output.
 
-Screenshot success is covered through the nested KWin/Xvfb fixture with explicit scrot selection, including cursor pixels, action frame bursts, retention, image oracles, and the reported `Coordinate space` mapping. This separates the known exact-virtual ScreenShot2 limitation from screenshot behavior that the suite can verify deterministically. Because the container has one nested output and no working ScreenShot2 capture, real multi-output captures, negative origins, ScreenShot2 `CaptureWorkspace` normalization, and Spectacle partial coverage are not captured here; `test_spectacle_composition.py` checks only the fallback decisions for such topologies with stubbed inputs.
+Provider-unavailable tests establish the failure precondition explicitly. When the native screenshot plugin is loaded, they unload it through `org.kde.KWin /Plugins`, verify that the ScreenShot2 provider is absent and real Spectacle fails without writing a PNG, then reload the plugin and verify provider recovery. The suite checks actionable errors, no failed-capture PNG artifacts, and warnings after actions without killing the engine or installed MCP server. Separate Spectacle `PATH` stubs check delayed success beyond the former 10-second bound, a reported timeout, and exit 0 without a file; they test fallback control flow rather than native pixel correctness.
+
+The version-selected fixtures preserve semantic pixels, cursor localization, action frame bursts, crop and retention behavior, and the reported `Coordinate space` mapping. Physical multi-output capture and negative-origin layouts remain unverified, as does Spectacle partial coverage on those layouts. `test_spectacle_composition.py` checks fallback decisions for synthetic topologies; it does not establish physical-display pixel coverage.

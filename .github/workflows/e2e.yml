@@ -6,6 +6,7 @@ on:
   pull_request:
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -70,7 +71,7 @@ jobs:
       - name: Download the KWin test image
         uses: actions/download-artifact@v8
         with:
-          name: e2e-image-${{ matrix.row.label }}-attempt-${{ github.run_attempt }}
+          name: e2e-image-${{ matrix.row.label }}
           path: ${{ runner.temp }}/e2e-image
 
       - name: Load the KWin test image
@@ -118,16 +119,81 @@ jobs:
           fi
           cat "$E2E_STATUS_FILE"
 
-      # No /dev/dri passthrough on purpose: KWin then runs on the same llvmpipe
-      # software path everywhere, so a run here matches a developer's laptop
-      # exactly. A DRM node would only let KWin register ScreenShot2, and its
-      # virtual backend still never answers a capture — see docker/README.md.
+      # No physical GPU or /dev/dri passthrough: KWin uses its llvmpipe software
+      # path. KWin >= 6.8 also needs the host's udmabuf allocator for its
+      # virtual software render device; only the actual E2E container gets it
+      # when needed.
+      - name: Prepare the udmabuf software allocator when required
+        shell: bash
+        run: |
+          set -euo pipefail
+          kwin_version="$(
+            docker run --rm --entrypoint kwin_wayland kwin-mcp-e2e --version
+          )"
+          echo "KWin version: $kwin_version"
+          if [[ ! "$kwin_version" =~ ([0-9]+)\.([0-9]+) ]]; then
+            echo "could not determine the KWin version" >&2
+            exit 1
+          fi
+          kwin_major="${BASH_REMATCH[1]}"
+          kwin_minor="${BASH_REMATCH[2]}"
+          if (( kwin_major > 6 || (kwin_major == 6 && kwin_minor >= 8) )); then
+            echo "KWIN_MCP_NEEDS_UDMABUF=1" >> "$GITHUB_ENV"
+            if [[ ! -c /dev/udmabuf ]]; then
+              if ! sudo -n modprobe udmabuf; then
+                echo "modprobe udmabuf returned non-zero; waiting for udev..." >&2
+              fi
+              if [[ ! -c /dev/udmabuf ]]; then
+                sudo -n udevadm settle --timeout=10
+              fi
+            fi
+            if [[ ! -c /dev/udmabuf ]]; then
+              echo "required character device /dev/udmabuf is unavailable" >&2
+              exit 1
+            fi
+            read -r major_hex minor_hex < <(stat -c '%t %T' /dev/udmabuf)
+            major=$((16#$major_hex))
+            minor=$((16#$minor_hex))
+            udmabuf_dev="/sys/class/misc/udmabuf/dev"
+            if [[ ! -r "$udmabuf_dev" ]]; then
+              echo "registered udmabuf identity is unavailable ($udmabuf_dev)" >&2
+              exit 1
+            fi
+            registered_device="$(<"$udmabuf_dev")"
+            if [[ "$registered_device" != "$major:$minor" ]]; then
+              echo "udmabuf identity mismatch: node=$major:$minor registered=$registered_device" >&2
+              exit 1
+            fi
+            echo "registered udmabuf device identity: $registered_device"
+            sysfs_device="/sys/dev/char/${major}:${minor}"
+            if [[ ! -e "$sysfs_device" ]]; then
+              echo "sysfs identity is unavailable for /dev/udmabuf ($major:$minor)" >&2
+              exit 1
+            fi
+            echo "udmabuf sysfs identity: $(readlink -f "$sysfs_device")"
+            cat "$sysfs_device/uevent"
+            stat -c 'udmabuf type=%F mode=%04a uid=%u gid=%g major=%t minor=%T' \
+              /dev/udmabuf
+          else
+            echo "KWin < 6.8 does not require /dev/udmabuf"
+            echo "KWIN_MCP_NEEDS_UDMABUF=0" >> "$GITHUB_ENV"
+          fi
+
+      # The actual E2E container gets only the software allocator device when
+      # KWin requires it, plus its existing host group. Quality and collect-only
+      # containers stay bare.
       - name: Run end-to-end tests
         shell: bash
         run: |
           set -o pipefail
+          docker_args=()
+          if [[ "${KWIN_MCP_NEEDS_UDMABUF:-0}" == 1 ]]; then
+            docker_args+=(--device=/dev/udmabuf:/dev/udmabuf:rw)
+            docker_args+=(--group-add "$(stat -c '%g' /dev/udmabuf)")
+            docker_args+=(--env KWIN_MCP_E2E_SCREENSHOT=1)
+          fi
           timeout --signal=INT --kill-after=1m 20m \
-            docker run \
+            docker run "${docker_args[@]}" \
               --name "$E2E_CONTAINER_NAME" \
               --env KWIN_MCP_E2E_STRICT_SKIPS=1 \
               --env KWIN_MCP_E2E_REQUIRE=layer-shell \
@@ -179,9 +245,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-status-${{ matrix.row.label }}-attempt-${{ github.run_attempt }}-s${{ matrix.shard }}
-          path: shard-status/
+          name: e2e-status-${{ matrix.row.label }}-s${{ matrix.shard }}
+          path: ${{ env.E2E_STATUS_FILE }}
           if-no-files-found: error
+          overwrite: true
 
   build-image:
     name: Build E2E image (${{ matrix.row.label }})
@@ -206,10 +273,11 @@ jobs:
       - name: Upload the KWin test image
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-image-${{ matrix.row.label }}-attempt-${{ github.run_attempt }}
+          name: e2e-image-${{ matrix.row.label }}
           path: ${{ runner.temp }}/image.tar.zst
           if-no-files-found: error
           compression-level: 0
+          overwrite: true
           retention-days: 1
 
   # Keeps the seven required check names `Virtual KWin session (<label>)`.
@@ -226,14 +294,84 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The label and run attempt precede the shard wildcard so only this
-      # row's current-attempt statuses are downloaded.
+      - name: Collect current-run job metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate --slurp \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?filter=latest&per_page=100" \
+            > "${{ runner.temp }}/e2e-jobs.json"
+
+      # GitHub can expose a just-finished matrix job as queued/in-progress for
+      # a short interval after `needs` releases this aggregator. Poll the
+      # current run before applying the fail-closed row checker.
+      - name: Wait for current-run jobs to settle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -eu
+          jobs_file="${{ runner.temp }}/e2e-jobs.json"
+          for attempt in $(seq 1 24); do
+            gh api --paginate --slurp \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs?filter=latest&per_page=100" \
+              > "$jobs_file"
+
+            set +e
+            python3 - "$jobs_file" "${{ matrix.row.label }}" <<'PY'
+          import json
+          import sys
+
+          jobs = [
+              job
+              for page in json.load(open(sys.argv[1], encoding="utf-8"))
+              for job in page["jobs"]
+          ]
+          label = sys.argv[2]
+          expected = [
+              f"Build E2E image ({label})",
+              *(f"E2E shard ({label}, {number}/5)" for number in range(1, 6)),
+          ]
+          matching = {name: [job for job in jobs if job["name"] == name] for name in expected}
+          if any(len(found) != 1 for found in matching.values()):
+              print("required jobs are not all visible yet", file=sys.stderr)
+              raise SystemExit(1)
+          if any(
+              found[0]["status"] == "completed" and found[0]["conclusion"] != "success"
+              for found in matching.values()
+          ):
+              print("a required job completed unsuccessfully", file=sys.stderr)
+              raise SystemExit(2)
+          if any(found[0]["status"] != "completed" for found in matching.values()):
+              print("required jobs are still settling", file=sys.stderr)
+              raise SystemExit(1)
+          PY
+            result=$?
+            set -e
+            if [[ "$result" -ne 1 ]]; then
+              break
+            fi
+            if [[ "$attempt" -lt 24 ]]; then
+              sleep 5
+            fi
+          done
+
+      # Stable names identify only this run's latest artifact set.  Each artifact
+      # contains one unique shard filename, so merging cannot mask a shard.
       - uses: actions/download-artifact@v8
+        continue-on-error: true
         with:
-          pattern: e2e-status-${{ matrix.row.label }}-attempt-${{ github.run_attempt }}-s*
+          pattern: e2e-status-${{ matrix.row.label }}-s*
           merge-multiple: true
           path: status
 
       - name: Require every shard to have succeeded and covered the suite
         shell: bash
-        run: python3 scripts/check_e2e_shards.py --status-dir status --label "${{ matrix.row.label }}" --shards 5
+        run: >-
+          python3 scripts/check_e2e_shards.py
+          --status-dir status
+          --jobs-file "${{ runner.temp }}/e2e-jobs.json"
+          --label "${{ matrix.row.label }}"
+          --shards 5
