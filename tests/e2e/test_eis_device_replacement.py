@@ -30,6 +30,7 @@ from gi.repository import GLib
 from probe_session import POLL_S, Probe, field, start_probe_session
 from visual_harness import _apply_output_scale
 
+from kwin_mcp.input import EISClient
 from kwin_mcp.models import HeldInput
 
 if TYPE_CHECKING:
@@ -118,7 +119,9 @@ def disconnect_eis(engine: AutomationEngine) -> None:
     info = engine.session_info().session
     assert info is not None
     assert engine._input is not None
-    cookie = engine._input._client._cookie
+    client = engine._input._client
+    assert isinstance(client, EISClient)
+    cookie = client._cookie
     bus = dbus.bus.BusConnection(info.dbus_address)
     try:
         remote_desktop = dbus.Interface(

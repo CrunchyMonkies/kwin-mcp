@@ -1,8 +1,8 @@
 [
  {
   "name": "session_start",
-  "title": "Start virtual KWin session",
-  "description": "Start an isolated virtual KWin Wayland session (one at a time). Then launch apps with app_launch.",
+  "title": "Start virtual session",
+  "description": "Start an isolated virtual KWin or Hyprland Wayland session (one at a time). Then launch apps with app_launch.",
   "inputSchema": {
    "properties": {
     "screen_width": {
@@ -49,6 +49,15 @@
       "artifacts": false,
       "home": false
      }
+    },
+    "compositor": {
+     "default": "kwin",
+     "description": "kwin_wayland --virtual, or Hyprland nested in a headless host.",
+     "enum": [
+      "kwin",
+      "hyprland"
+     ],
+     "type": "string"
     }
    },
    "type": "object",
@@ -125,10 +134,11 @@
     "input_backend": {
      "anyOf": [
       {
-       "type": "string",
        "enum": [
-        "eis"
-       ]
+        "eis",
+        "virtual"
+       ],
+       "type": "string"
       },
       {
        "type": "null"
@@ -152,6 +162,14 @@
       "type": "string"
      },
      "type": "array"
+    },
+    "compositor": {
+     "default": "kwin",
+     "enum": [
+      "kwin",
+      "hyprland"
+     ],
+     "type": "string"
     }
    },
    "required": [
@@ -175,18 +193,18 @@
  },
  {
   "name": "session_connect",
-  "title": "Attach to live KDE desktop",
-  "description": "Attach to an already running KWin session (the real desktop or a container). Actions then affect real applications; window_close asks the user first.",
+  "title": "Attach to live desktop",
+  "description": "Attach to an already running KWin or Hyprland session (the real desktop or a container). Actions then affect real applications; window_close asks the user first.",
   "inputSchema": {
    "properties": {
     "dbus_address": {
      "default": "",
-     "description": "Session bus address; empty = $DBUS_SESSION_BUS_ADDRESS.",
+     "description": "Session bus address; empty = $DBUS_SESSION_BUS_ADDRESS, else $XDG_RUNTIME_DIR/bus.",
      "type": "string"
     },
     "wayland_display": {
      "default": "",
-     "description": "Socket name or path; empty = $WAYLAND_DISPLAY.",
+     "description": "Socket name or path; empty = $WAYLAND_DISPLAY, else the running desktop's.",
      "type": "string"
     },
     "enable_accessibility": {
@@ -288,10 +306,11 @@
     "input_backend": {
      "anyOf": [
       {
-       "type": "string",
        "enum": [
-        "eis"
-       ]
+        "eis",
+        "virtual"
+       ],
+       "type": "string"
       },
       {
        "type": "null"
@@ -315,6 +334,14 @@
       "type": "string"
      },
      "type": "array"
+    },
+    "compositor": {
+     "default": "kwin",
+     "enum": [
+      "kwin",
+      "hyprland"
+     ],
+     "type": "string"
     }
    },
    "required": [
@@ -516,10 +543,11 @@
         "input_backend": {
          "anyOf": [
           {
-           "type": "string",
            "enum": [
-            "eis"
-           ]
+            "eis",
+            "virtual"
+           ],
+           "type": "string"
           },
           {
            "type": "null"
@@ -543,6 +571,14 @@
           "type": "string"
          },
          "type": "array"
+        },
+        "compositor": {
+         "default": "kwin",
+         "enum": [
+          "kwin",
+          "hyprland"
+         ],
+         "type": "string"
         }
        },
        "required": [

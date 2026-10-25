@@ -3,8 +3,8 @@
  "tools": [
   {
    "name": "session_start",
-   "title": "Start virtual KWin session",
-   "description": "Start an isolated virtual KWin Wayland session (one at a time). Then launch apps with app_launch.",
+   "title": "Start virtual session",
+   "description": "Start an isolated virtual KWin or Hyprland Wayland session (one at a time). Then launch apps with app_launch.",
    "annotations": {
     "readOnlyHint": false,
     "destructiveHint": false,
@@ -44,6 +44,12 @@
       "home": false
      },
      "description": "What survives the session end, decided now and honoured by session_stop and server exit."
+    },
+    {
+     "name": "compositor",
+     "required": false,
+     "default": "kwin",
+     "description": "kwin_wayland --virtual, or Hyprland nested in a headless host."
     }
    ],
    "output": [
@@ -57,13 +63,14 @@
     "input_backend",
     "clipboard",
     "accessibility",
-    "warnings"
+    "warnings",
+    "compositor"
    ]
   },
   {
    "name": "session_connect",
-   "title": "Attach to live KDE desktop",
-   "description": "Attach to an already running KWin session (the real desktop or a container). Actions then affect real applications; window_close asks the user first.",
+   "title": "Attach to live desktop",
+   "description": "Attach to an already running KWin or Hyprland session (the real desktop or a container). Actions then affect real applications; window_close asks the user first.",
    "annotations": {
     "readOnlyHint": false,
     "destructiveHint": false,
@@ -75,13 +82,13 @@
      "name": "dbus_address",
      "required": false,
      "default": "",
-     "description": "Session bus address; empty = $DBUS_SESSION_BUS_ADDRESS."
+     "description": "Session bus address; empty = $DBUS_SESSION_BUS_ADDRESS, else $XDG_RUNTIME_DIR/bus."
     },
     {
      "name": "wayland_display",
      "required": false,
      "default": "",
-     "description": "Socket name or path; empty = $WAYLAND_DISPLAY."
+     "description": "Socket name or path; empty = $WAYLAND_DISPLAY, else the running desktop's."
     },
     {
      "name": "enable_accessibility",
@@ -110,7 +117,8 @@
     "input_backend",
     "clipboard",
     "accessibility",
-    "warnings"
+    "warnings",
+    "compositor"
    ]
   },
   {
