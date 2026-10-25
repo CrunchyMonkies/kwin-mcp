@@ -18,6 +18,7 @@ import pytest
 
 from kwin_mcp import compositor, geometry, hyprland, screenshot, session
 from kwin_mcp.compositor import CompositorTarget
+from kwin_mcp.input import paste_chord
 from kwin_mcp.models import ScreenSize, SessionInfo
 from kwin_mcp.screenshot import OutputGeometry, WorkspaceTopology
 
@@ -383,6 +384,21 @@ def test_topology_parses_hyprland_outputs(fake: FakeHyprland) -> None:
 
 
 # ── Input ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("app_class", "chord"),
+    [
+        ("org.omarchy.btop", "ctrl+shift+v"),
+        ("org.omarchy.terminal", "ctrl+shift+v"),
+        ("TUI.float", "ctrl+shift+v"),
+        ("Alacritty", "ctrl+shift+v"),
+        ("com.mitchellh.ghostty", "ctrl+shift+v"),
+        ("chromium", "ctrl+v"),
+    ],
+)
+def test_omarchy_terminals_paste_on_ctrl_shift_v(app_class: str, chord: str) -> None:
+    assert paste_chord(app_class) == chord
 
 
 def test_discrete_scroll_converts_120ths_to_detents(monkeypatch: pytest.MonkeyPatch) -> None:

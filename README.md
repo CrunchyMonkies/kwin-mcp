@@ -545,6 +545,7 @@ On Omarchy:
 
 - `session_connect()` with no arguments finds the running Omarchy desktop even when your MCP client starts kwin-mcp without the desktop's environment. With several Hyprland instances running, it picks the oldest; pass `wayland_display` to choose another.
 - Injected chords reach Hyprland's key bindings too: `keyboard_press keys="super+return"` opens a terminal, exactly as on the real keyboard.
+- Omarchy's TUIs run in terminals with their own app ids (`org.omarchy.<name>`, `TUI.float`, `TUI.tile`). The Unicode clipboard fallback recognises them as terminals and pastes with Ctrl+Shift+V.
 - Accessibility is off by default. Connect with `enable_accessibility=true` before querying elements of apps that check it, such as Firefox and Chromium.
 - Hyprland's permission system (`ecosystem:enforce_permissions`, off by default) can deny screencopy to `grim` or a new keyboard device to kwin-mcp. If `screen_capture` or input fails with a permission error, add `permission` rules that allow them.
 
