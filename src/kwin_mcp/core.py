@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
-from kwin_mcp import progress
+from kwin_mcp import compositor, progress
+from kwin_mcp.compositor import KWIN, CompositorName, CompositorTarget
 from kwin_mcp.geometry import select_one, select_windows, window_from_kwin
 from kwin_mcp.input import (
     EIS_DISCONNECTED_WARNING,
@@ -125,7 +126,8 @@ NO_SESSION_TEXT = (
     "No session running.\nCall session_start (virtual) or session_connect (live desktop)."
 )
 NO_INPUT_TEXT = (
-    "No input backend (KWin EIS unavailable); install kwin-common or reconnect.\n"
+    "No input backend (KWin EIS or Hyprland virtual input unavailable); "
+    "install kwin-common (KWin) or reconnect.\n"
     "Call session_stop, then session_start or session_connect again."
 )
 NO_CLIPBOARD_TEXT = (
@@ -400,6 +402,8 @@ class AutomationEngine:
         self._screenshot_max_edge = screenshot_max_edge
         self._session: Session | LiveSession | None = None
         self._input: InputBackend | None = None
+        # The compositor of the current session (KWin when none is running).
+        self._compositor: CompositorTarget = KWIN
         self._clipboard_enabled: bool = False
         # What session_start/session_connect decided, reported by session_info.
         self._retention: Retention = NO_RETENTION
@@ -467,7 +471,28 @@ class AutomationEngine:
             env["XDG_STATE_HOME"] = str(info.home_dir / ".local" / "state")
         env["QT_QPA_PLATFORM"] = "wayland"
         env.pop("DISPLAY", None)
+        # The geometry helper and the AT-SPI worker pick their compositor from this.
+        env.pop(compositor.HYPRLAND_SIGNATURE_ENV, None)
+        env.update(self._compositor.env())
         return env
+
+    def _make_input(self, dbus_address: str, wayland_socket: str) -> InputBackend:
+        """The input backend of the current compositor: KWin EIS or Wayland virtual input."""
+        if not self._compositor.is_hyprland:
+            return InputBackend(dbus_address)
+        from kwin_mcp import hyprland
+        from kwin_mcp.wayland_input import VirtualInputClient
+
+        target = self._compositor
+
+        def layout() -> tuple[float, float, float, float]:
+            virtual = hyprland.outputs(target)["virtual"]
+            if not isinstance(virtual, list) or len(virtual) != 4:
+                msg = "Hyprland reported no outputs to map pointer coordinates onto"
+                raise RuntimeError(msg)
+            return (float(virtual[0]), float(virtual[1]), float(virtual[2]), float(virtual[3]))
+
+        return InputBackend(dbus_address, client=VirtualInputClient(wayland_socket, layout))
 
     def _a11y_bus_address(self, env: dict[str, str]) -> str:
         """Identity of the session's AT-SPI bus; ``""`` when it cannot be read.
@@ -757,6 +782,7 @@ class AutomationEngine:
                 region=_rect_tuple(capture.region),
                 max_edge=max_edge,
                 wayland_socket=info.wayland_socket,
+                target=self._compositor,
             )
             frames: list[Frame] = []
             for delay_ms, path, mapping in burst:
@@ -836,15 +862,27 @@ class AutomationEngine:
             home_dir=None if info.home_dir is None else str(info.home_dir),
             retention=self._retention,
             artifacts_dir=str(info.screenshot_dir),
-            input_backend="eis" if self._input is not None and not self._eis_lost else None,
+            input_backend=(
+                None
+                if self._input is None or self._eis_lost
+                else "virtual"
+                if self._compositor.is_hyprland
+                else "eis"
+            ),
             clipboard=self._clipboard_enabled,
             accessibility=self._accessibility,
             warnings=list(self._session_warnings),
+            compositor=self._compositor.name,
         )
+
+    def _set_compositor(self, target: CompositorTarget) -> None:
+        """Point the engine (and so every backend it calls) at ``target``."""
+        self._compositor = target
 
     def _reset_session_state(self) -> None:
         self._session = None
         self._input = None
+        self._set_compositor(KWIN)
         self._clipboard_enabled = False
         self._retention = NO_RETENTION
         self._screen = None
@@ -861,17 +899,24 @@ class AutomationEngine:
         enable_clipboard: bool = False,
         home: HomeMode = "host",
         retention: Retention = NO_RETENTION,
+        compositor: CompositorName = "kwin",
     ) -> SessionInfo:
-        """Start an isolated virtual KWin Wayland session (one at a time).
+        """Start an isolated virtual Wayland session (one at a time).
 
-        Startup is atomic: when any step after argument validation fails, the
-        partly started session is stopped (with the usual retention rules) and
-        the original exception propagates, so no session is left behind.
+        ``compositor="kwin"`` runs ``kwin_wayland --virtual``;
+        ``compositor="hyprland"`` runs a private Hyprland nested in a headless
+        host compositor. Startup is atomic: when any step after argument
+        validation fails, the partly started session is stopped (with the
+        usual retention rules) and the original exception propagates, so no
+        session is left behind.
         """
         for name, value in (("screen_width", screen_width), ("screen_height", screen_height)):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 msg = f"{name} must be a positive integer, got {value!r}"
                 raise ValueError(msg)
+        if compositor not in ("kwin", "hyprland"):
+            msg = f"compositor must be 'kwin' or 'hyprland', got {compositor!r}"
+            raise ValueError(msg)
         if retention.home and home == "host":
             msg = (
                 "retention.home=true needs home='isolated'.\n"
@@ -897,14 +942,16 @@ class AutomationEngine:
                 enable_clipboard=enable_clipboard,
                 home=home,
                 retention=retention,
+                compositor=compositor,
             )
             info = session.start(config, progress_total=total_steps)
             warnings.extend(info.startup_warnings)
+            self._set_compositor(info.compositor)
 
-            # start() returned only after KWin took org.kde.KWin, so the EIS
-            # object is reachable.
+            # start() returned only after KWin took org.kde.KWin (or Hyprland
+            # opened its IPC socket), so the input backend is reachable.
             try:
-                self._input = InputBackend(info.dbus_address)
+                self._input = self._make_input(info.dbus_address, info.wayland_socket)
             except RuntimeError as exc:
                 self._input = None
                 warnings.append(f"No input backend available ({exc})")
@@ -981,17 +1028,29 @@ class AutomationEngine:
             )
             raise RuntimeError(msg)
 
-        # Validate KWin is reachable on the given D-Bus
-        import dbus as dbus_module
-        import dbus.bus
+        target = compositor.detect_live(wayland_display=wayland_disp)
+        if target.is_hyprland:
+            # Hyprland is driven over its IPC socket, not D-Bus.
+            from kwin_mcp import hyprland
 
-        try:
-            bus = dbus.bus.BusConnection(dbus_addr)
-            bus.get_object("org.kde.KWin", "/org/kde/KWin")
-        except dbus_module.DBusException as exc:
-            msg = f"Cannot reach KWin on D-Bus ({dbus_addr}): {exc}"
-            raise RuntimeError(msg) from exc
-        progress.report(1, 3, "KWin reachable on D-Bus")
+            try:
+                hyprland.request("j/version", target)
+            except hyprland.HyprlandError as exc:
+                msg = f"Cannot reach Hyprland ({target.hyprland_signature}): {exc}"
+                raise RuntimeError(msg) from exc
+            progress.report(1, 3, "Hyprland reachable over IPC")
+        else:
+            # Validate KWin is reachable on the given D-Bus
+            import dbus as dbus_module
+            import dbus.bus
+
+            try:
+                bus = dbus.bus.BusConnection(dbus_addr)
+                bus.get_object("org.kde.KWin", "/org/kde/KWin")
+            except dbus_module.DBusException as exc:
+                msg = f"Cannot reach KWin on D-Bus ({dbus_addr}): {exc}"
+                raise RuntimeError(msg) from exc
+            progress.report(1, 3, "KWin reachable on D-Bus")
 
         display_path = Path(wayland_disp)
         if not display_path.is_absolute():
@@ -1029,18 +1088,21 @@ class AutomationEngine:
         if not retention.artifacts:
             process_registry.register_temp_dir(screenshot_dir)
 
-        session = LiveSession(dbus_addr, wayland_disp, screenshot_dir, retention=retention)
+        session = LiveSession(
+            dbus_addr, wayland_disp, screenshot_dir, retention=retention, compositor=target
+        )
         self._session = session
+        self._set_compositor(target)
         self._retention = retention
         self._eis_lost = False
         # Clipboard is always available on live sessions
         self._clipboard_enabled = True
 
         warnings: list[str] = []
-        # The check above already found org.kde.KWin owned, so no settle delay
-        # is needed before the EIS connection.
+        # The check above already found org.kde.KWin owned (or Hyprland's IPC
+        # answering), so no settle delay is needed before the input connection.
         try:
-            self._input = InputBackend(dbus_addr)
+            self._input = self._make_input(dbus_addr, wayland_disp)
         except RuntimeError as exc:
             self._input = None
             warnings.append(f"No input backend available ({exc})")
@@ -1189,6 +1251,7 @@ class AutomationEngine:
             wayland_socket=info.wayland_socket,
             include_cursor=include_cursor,
             output_dir=info.screenshot_dir,
+            target=self._compositor,
         )
         try:
             mapping = reframe_screenshot(

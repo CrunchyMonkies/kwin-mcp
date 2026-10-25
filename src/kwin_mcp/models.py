@@ -33,6 +33,8 @@ WaitUntil = Literal["present", "absent"]
 MatchMode = Literal["substring", "exact", "spoken"]
 WindowKind = Literal["normal", "dialog", "utility", "popup", "shell", "other"]
 SessionKind = Literal["virtual", "live"]
+# The compositor a session drives (kept equal to compositor.CompositorName).
+Compositor = Literal["kwin", "hyprland"]
 AccessibilityState = Literal["on", "switched_on", "off", "unavailable"]
 CloseConsent = Literal[
     "not_required", "accepted", "not_confirmed", "declined", "cancelled", "unsupported"
@@ -1003,6 +1005,14 @@ _ACCESSIBILITY_LINES: dict[AccessibilityState, str] = {
 }
 
 
+_COMPOSITOR_LABELS: dict[str, str] = {"kwin": "KWin", "hyprland": "Hyprland"}
+_INPUT_BACKEND_LINES: dict[str | None, str] = {
+    "eis": "Input backend: KWin EIS",
+    "virtual": "Input backend: Wayland virtual pointer/keyboard (no touch)",
+    None: "Input backend: none",
+}
+
+
 class SessionInfo(BaseModel):
     """The running session."""
 
@@ -1013,13 +1023,16 @@ class SessionInfo(BaseModel):
     home_dir: str | None = None
     retention: Retention = Field(default_factory=Retention)
     artifacts_dir: str
-    input_backend: Literal["eis"] | None
+    input_backend: Literal["eis", "virtual"] | None
     clipboard: bool
     accessibility: AccessibilityState
     warnings: list[str] = Field(default_factory=list)
+    compositor: Compositor = "kwin"
 
     def _detail_lines(self) -> list[str]:
         lines: list[str] = []
+        if self.compositor != "kwin":
+            lines.append(f"Compositor: {_COMPOSITOR_LABELS[self.compositor]}")
         if self.home_dir is not None:
             lines.append(f"Isolated home: {self.home_dir}")
         screen = "unknown" if self.screen is None else f"{self.screen.width}x{self.screen.height}"
@@ -1030,9 +1043,7 @@ class SessionInfo(BaseModel):
             f"home={str(self.retention.home).lower()}"
         )
         lines.append(f"Clipboard: {'enabled' if self.clipboard else 'disabled'}")
-        lines.append(
-            "Input backend: KWin EIS" if self.input_backend == "eis" else "Input backend: none"
-        )
+        lines.append(_INPUT_BACKEND_LINES[self.input_backend])
         lines.append(_ACCESSIBILITY_LINES[self.accessibility])
         lines.extend(_warning_lines(self.warnings))
         return lines
@@ -1041,8 +1052,8 @@ class SessionInfo(BaseModel):
         """The session_start / session_connect text."""
         if self.kind == "live":
             head = [
-                f"Connected to live KWin session. D-Bus: {self.dbus_address}, "
-                f"Wayland: {self.wayland_socket}"
+                f"Connected to live {_COMPOSITOR_LABELS[self.compositor]} session. "
+                f"D-Bus: {self.dbus_address}, Wayland: {self.wayland_socket}"
             ]
         else:
             head = [

@@ -1,6 +1,6 @@
 # kwin-mcp
 
-**Model Context Protocol server for Linux desktop GUI automation on KDE Plasma 6 Wayland**
+**Model Context Protocol server for Linux desktop GUI automation on KDE Plasma 6 and Hyprland (Omarchy) Wayland**
 
 [![PyPI version](https://img.shields.io/pypi/v/kwin-mcp)](https://pypi.org/project/kwin-mcp/)
 [![Downloads](https://img.shields.io/pypi/dm/kwin-mcp)](https://pypi.org/project/kwin-mcp/)
@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![CI](https://github.com/isac322/kwin-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/isac322/kwin-mcp/actions/workflows/ci.yml)
 
-A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI agents (Claude Code, Cursor, and other MCP clients) to launch, interact with, and observe any Wayland application in an isolated virtual KWin session -- without affecting the user's desktop display or input. It also supports **live desktop automation** by connecting to an existing KWin session (real desktop or container) for collaborative workflows. With 29 MCP tools covering sessions, apps, screen capture, the AT-SPI2 accessibility tree, window management, mouse, keyboard, touch, clipboard, and D-Bus, kwin-mcp provides everything needed for end-to-end GUI testing and desktop automation on Linux.
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that enables AI agents (Claude Code, Cursor, and other MCP clients) to launch, interact with, and observe any Wayland application in an isolated virtual KWin session -- without affecting the user's desktop display or input. It also supports **live desktop automation** by connecting to an existing KWin session (real desktop or container) for collaborative workflows, and drives **Hyprland and Omarchy** desktops through the same tools (see [Hyprland and Omarchy](#hyprland-and-omarchy)). With 29 MCP tools covering sessions, apps, screen capture, the AT-SPI2 accessibility tree, window management, mouse, keyboard, touch, clipboard, and D-Bus, kwin-mcp provides everything needed for end-to-end GUI testing and desktop automation on Linux.
 
 > [!IMPORTANT]
 > **kwin-mcp 1.0 renamed and reshaped the tools.** The 29 tools of 1.0 replace the 37 tools of 0.12, with shared argument types and structured output on every tool. A removed tool name returns an error that names its replacement. See [Migrating from 0.11](#migrating-from-011) (also covers 0.12).
@@ -23,6 +23,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that e
 - [Available Tools](#available-tools)
 - [Shared Argument Types](#shared-argument-types)
 - [How It Works](#how-it-works)
+- [Hyprland and Omarchy](#hyprland-and-omarchy)
 - [System Requirements](#system-requirements)
 - [Installation](#installation)
 - [Migrating from 0.11](#migrating-from-011)
@@ -297,7 +298,7 @@ kwin-mcp registers 29 tools. Parameters are listed in schema order: a bare name 
 
 | Tool | Parameters | Description |
 |------|-----------|-------------|
-| `session_start` | `screen_width?=1920`, `screen_height?=1080`, `enable_clipboard?=false`, `home?="host"`, `retention?={"artifacts":false,"home":false}` | Start an isolated virtual KWin Wayland session (one at a time) with its own `dbus-run-session` bus, `kwin_wayland --virtual` compositor, AT-SPI2 bus and EIS input. `screen_width`/`screen_height` must be positive integers. `enable_clipboard=true` serves the clipboard tools (off by default because `wl-copy` can hang on a freshly created bus). `home="isolated"` gives launched apps a temporary HOME with isolated XDG directories (not a security sandbox; see [Isolation scope](#isolation-scope)). `retention={artifacts, home}` decides now what survives the session end: the artifacts directory (screenshots, frames, app logs) and the isolated HOME; `home=true` requires `home="isolated"`. Startup is deadline-bounded and atomic: a failed step stops the partly started session and reports the captured session stderr. Then launch apps with `app_launch`. |
+| `session_start` | `screen_width?=1920`, `screen_height?=1080`, `enable_clipboard?=false`, `home?="host"`, `retention?={"artifacts":false,"home":false}`, `compositor?="kwin"` | Start an isolated virtual Wayland session (one at a time) with its own `dbus-run-session` bus, compositor, AT-SPI2 bus and input. `compositor="kwin"` runs `kwin_wayland --virtual` with EIS input; `compositor="hyprland"` runs a private Hyprland nested in a headless host compositor (see [Hyprland and Omarchy](#hyprland-and-omarchy)). `screen_width`/`screen_height` must be positive integers. `enable_clipboard=true` serves the clipboard tools (off by default because `wl-copy` can hang on a freshly created bus). `home="isolated"` gives launched apps a temporary HOME with isolated XDG directories (not a security sandbox; see [Isolation scope](#isolation-scope)). `retention={artifacts, home}` decides now what survives the session end: the artifacts directory (screenshots, frames, app logs) and the isolated HOME; `home=true` requires `home="isolated"`. Startup is deadline-bounded and atomic: a failed step stops the partly started session and reports the captured session stderr. Then launch apps with `app_launch`. |
 | `session_connect` | `dbus_address?=""`, `wayland_display?=""`, `enable_accessibility?=false`, `retention?={"artifacts":false,"home":false}` | Attach to an already running KWin session: the real desktop or a KWin inside a container. Empty values default to `$DBUS_SESSION_BUS_ADDRESS` and `$WAYLAND_DISPLAY` (a socket name is resolved under `$XDG_RUNTIME_DIR`). Clipboard is always enabled. Actions affect real applications, and `window_close` asks the user first (see [Live Window Close Consent](#live-window-close-consent---live-consent)). `enable_accessibility=true` turns on the desktop's `org.a11y.Status.IsEnabled` switch until `session_stop` (see [Accessibility Tree](#accessibility-tree)). `retention.home` is an error here; live sessions use the host HOME. |
 | `session_stop` | _(none)_ | End the current session. Virtual: terminate the whole session process group (`SIGTERM`, then `SIGKILL` for members that remain), KWin, launched apps and the bus. Live: detach, kill only apps launched through kwin-mcp, restore the accessibility switch. Releases all held input and reports it. Idempotent: with no session it returns `stopped: false` and `No session running.` |
 | `session_info` | _(none)_ | Report the current session (or `null`): its kind, Wayland socket, bus address, screen size, enabled backends (input, clipboard, accessibility), retention and artifacts directory, every app launched through kwin-mcp, and the held input. Works without a session. |
@@ -517,6 +518,44 @@ Failed direct startup reports a `Warning:` line and lets KWin continue. Rollback
 The private helper uses the server's existing `sys.executable` with `-I -S` to run the installed, standard-library-only `dbus_service_file.py`, then `os.execv` on the parsed executable. It is internal startup machinery, not another installation step or MCP tool. This avoids implicit `PATH` lookup, shell builtins, function evaluation, and `ENOEXEC` shell fallback; explicitly configured `/bin/sh -c` commands and legitimate `#!` scripts remain supported. Direct processes keep the same user, private bus, session process group, environment, and inherited working directory; relative executables resolve against the server's working directory, not an isolated directory. They start from the server process's SELinux domain rather than through normal D-Bus service activation, which can mean less confinement. The opt-in does not change SELinux policy or provide a general sandbox. Successful direct startup also reports a `Warning:` line. Tests simulate activation denial; they do not verify this path on an SELinux-enforcing Fedora host.
 
 Firefox, like other apps that check it, exposes an accessibility tree only while the session's `org.a11y.Status.IsEnabled` switch is on, and a stock Plasma session leaves it off. Virtual sessions switch it on before any app starts; their accessibility bus is private, so the host desktop is unaffected. A live session (`session_connect`) does not change it by default; the result's `accessibility` field says whether it is on. Pass `enable_accessibility=true` to switch it on for the whole desktop until `session_stop`, which switches it back off (unless it was already on before the connection). The restore turns the switch back off whenever this connection turned it on, so a change the user makes to the switch while connected is overwritten at `session_stop`; enabling accessibility before connecting keeps it on. Every switch read and write is bounded to a few seconds, so a stalled desktop bus cannot hold `session_stop` or the server's exit. Firefox follows the change at runtime; an app that reads the switch only at startup must be restarted. The server's exit switches it back off too, including when a tool is still running. Restoring is best-effort: a server killed with `SIGKILL`, or a bus that refuses the call, leaves the switch on. Launch Chromium with `--force-renderer-accessibility` to expose web page content: in Chromium 154 the switch alone gave only empty window frames, and the flag gave the page tree whatever the switch.
+
+## Hyprland and Omarchy
+
+kwin-mcp also drives [Hyprland](https://hypr.land/), including [Omarchy](https://omarchy.org/) desktops, with the same 29 tools. The compositor-specific parts are swapped out; the tool surface, element refs, coordinates (global logical px) and results stay the same.
+
+| Area | KWin | Hyprland |
+|------|------|----------|
+| Live desktop | `session_connect` | `session_connect`, detected from `HYPRLAND_INSTANCE_SIGNATURE`, or from the Hyprland instance whose `hyprland.lock` names the `wayland_display` you connect to |
+| Virtual session | `session_start` | `session_start(compositor="hyprland")`: a private Hyprland nested in a headless host compositor (`kwin_wayland --virtual`, else `weston --backend=headless`; force one with `KWIN_MCP_HYPRLAND_HOST=kwin\|weston`) |
+| Windows and desktops | KWin scripting over D-Bus | Hyprland IPC socket (no `hyprctl` binary needed); desktops are workspaces, addressed by workspace id (special workspaces have negative ids) |
+| Input | KWin EIS (libei) | `zwlr_virtual_pointer_v1` and `zwp_virtual_keyboard_v1`, with a US keymap uploaded for the virtual keyboard only. There is no touch |
+| Screenshots | ScreenShot2, Spectacle | `grim` (wlr-screencopy) |
+| Accessibility, clipboard, D-Bus | AT-SPI2, ext/wlr data-control | unchanged |
+
+What differs on Hyprland:
+
+- **No touch input.** `touch_tap`, `touch_swipe` and `touch_pinch` fail with an error; use the pointer tools.
+- **Every window is `kind: "normal"`.** Hyprland reports no window types or transient relationships, so a desktop move never carries over to other windows.
+- **`window_place` floats a tiled window first.** A tiled window's geometry belongs to the layout. Placing it makes it floating, and the readback shows the result. A client with a fixed size (a GTK dialog) keeps its size and is moved to the requested position.
+- **Typing does not depend on the desktop's layout.** `keyboard_type(method="keys")` and `keyboard_press` use a US keymap on kwin-mcp's own virtual keyboard, so they type correctly on a desktop with any layout. `keyboard_type(method="unicode")` uses `wtype`, which Hyprland supports.
+- **Hyprland 0.56+ Lua configs and older hyprlang configs** are both supported: dispatchers are sent in whichever syntax the running Hyprland accepts.
+- **Virtual sessions** pin one output at the requested size and scale 1, a US keymap, click-to-focus (`follow_mouse = 2`), no animations, no Xwayland, and no first-run popups. Hyprland never touches a DRM or input device of the real seat (`AQ_DRM_DEVICES=/nonexistent`, `LIBSEAT_BACKEND=noop`).
+
+On Omarchy:
+
+- Run kwin-mcp from a terminal of the desktop so it inherits `HYPRLAND_INSTANCE_SIGNATURE`. If your MCP client starts it as a service with no desktop environment, pass `wayland_display` (usually `wayland-1`) to `session_connect`.
+- Injected chords reach Hyprland's key bindings too: `keyboard_press keys="super+return"` opens a terminal, exactly as on the real keyboard.
+- Accessibility is off by default. Connect with `enable_accessibility=true` before querying elements of apps that check it, such as Firefox and Chromium.
+- Hyprland's permission system (`ecosystem:enforce_permissions`, off by default) can deny screencopy to `grim` or a new keyboard device to kwin-mcp. If `screen_capture` or input fails with a permission error, add `permission` rules that allow them.
+
+Install the Hyprland runtime packages on Arch or Omarchy:
+
+```bash
+sudo pacman -S --needed grim at-spi2-core python-gobject libxkbcommon wl-clipboard wtype
+# Only for session_start(compositor="hyprland"): a headless host compositor
+sudo pacman -S --needed weston
+```
+
 ## System Requirements
 
 | Requirement | Details |
@@ -667,7 +706,7 @@ The [1.0.0 entry of the CHANGELOG](CHANGELOG.md#100---2026-10-15) has the full t
 - **US QWERTY keyboard layout only** -- `keyboard_type(method="keys")` supports US QWERTY only: letters, digits, ASCII punctuation, space, tab, and newline. Text containing any other character (non-ASCII such as Korean, CJK, or accented letters, `\r`, or other control characters) is rejected before anything is typed, with an error naming the unsupported characters; use `keyboard_type(method="unicode")` for it. Virtual sessions pin the compositor keymap to US, so the host's keyboard layout settings do not change what is typed; a live session attached with `session_connect` keeps the desktop's own keymap, so its active layout must be US for `keyboard_type` and `keyboard_press` to produce the expected characters.
 - **Unicode typing can paste through the clipboard** -- When `wtype` is unavailable or unsupported by the session, `keyboard_type(method="unicode")` briefly puts the text on the clipboard, then restores the previous selection and keeps serving it until another copy replaces it, even after `session_stop` disconnects a live session. The restore is best-effort, not atomic: Wayland has no compare-and-swap for the selection, so a copy another client makes at the same moment as the restore can be overwritten. Wayland also does not tell the clipboard owner which client read the text, so a clipboard manager that reads it after the paste chord can be taken for the target app, and any client that read it keeps its copy. The `x-kde-passwordManagerHint` marker keeps the text out of Klipper's history, but clipboard managers that ignore the marker can still record it.
 - **Unicode typing into terminals is limited** -- Terminals do not paste on Ctrl+V, and one that does not bind it passes it to the program as `^V`, which changes the next key (a Return arrives as a literal CR). `keyboard_type(method="unicode")` therefore checks KWin's active window first and sends Ctrl+Shift+V to terminals known to paste on it (Konsole, Yakuake, GNOME Terminal, GNOME Console, kitty, Alacritty, WezTerm, foot, Ghostty, st, Xfce Terminal, Tilix, Terminator). Window classes recognized as terminals but with no clipboard paste chord (xterm and urxvt, whose Shift+Insert pastes the primary selection) and windows KWin cannot identify get an error without any key being pressed; a terminal whose class is not recognized still gets Ctrl+V. Only Konsole is exercised by the test suite; the other chords follow each terminal's documented default bindings, so a remapped paste shortcut breaks delivery there.
-- **KDE Plasma 6+ required** -- Older KDE versions or other Wayland compositors (GNOME, Sway) are not supported.
+- **KDE Plasma 6+ or Hyprland required** -- Older KDE versions or other Wayland compositors (GNOME, Sway) are not supported. Hyprland has no touch input; see [Hyprland and Omarchy](#hyprland-and-omarchy).
 - **AT-SPI2 availability varies** -- Some applications may not fully expose their widget tree via AT-SPI2.
 - **Touch input is EIS-emulated** -- Touch events are emulated through KWin's EIS interface, not from a real touchscreen device. Most applications handle emulated touch correctly, but some may behave differently from physical touch.
 - **Clipboard requires opt-in on virtual sessions** -- `clipboard_read` and `clipboard_write` are disabled by default in virtual sessions because `wl-copy` can hang in isolated sessions. Enable them with `session_start(enable_clipboard=true)`, and ensure `wl-clipboard` is installed. Live sessions always have the clipboard.

@@ -41,6 +41,8 @@ KNOWN_LIMIT_PREFIXES: Final[tuple[str, ...]] = (
     # QA-INP-047: KWin 6.7.5 (Fedora 44, Tumbleweed, Arch) crashes (SIGSEGV) when an
     # EIS client holding a button and a key is SIGKILLed; KWin 6.3.6 (Debian) survives.
     "KWin limit: KWin crashes when a killed EIS client held input",
+    # test_hyprland_session.py: the KWin E2E images do not install Hyprland.
+    "Hyprland is not installed",
 )
 
 # The test the shard order starts with: a broken GtkLayerShell/LD_PRELOAD shim

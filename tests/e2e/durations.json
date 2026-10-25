@@ -21,6 +21,7 @@
   "tests/e2e/test_exit_cleanup_live.py": 28.3,
   "tests/e2e/test_exit_cleanup_virtual.py": 103.7,
   "tests/e2e/test_held_input.py": 52.7,
+  "tests/e2e/test_hyprland_session.py": 40.0,
   "tests/e2e/test_input_options_matrix.py": 59.4,
   "tests/e2e/test_installed_package.py": 30.3,
   "tests/e2e/test_keyboard_hold.py": 22.7,

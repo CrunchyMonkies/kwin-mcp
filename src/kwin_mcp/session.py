@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import select
 import shlex
 import shutil
@@ -24,11 +25,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kwin_mcp import dbus_service_file, progress
+from kwin_mcp.compositor import HYPRLAND_SIGNATURE_ENV, CompositorTarget
 from kwin_mcp.models import NO_RETENTION, AppEntry, AppLogResult, KeptPaths
 
 if TYPE_CHECKING:
     from typing import IO
 
+    from kwin_mcp.compositor import CompositorName
     from kwin_mcp.models import HomeMode, Retention
 
 # Upper bound for the startup handshake. The wrapper itself is bounded: the
@@ -85,6 +88,9 @@ class SessionConfig:
     retention: Retention = NO_RETENTION
     socket_name: str = ""
     extra_env: dict[str, str] = field(default_factory=dict)
+    # "hyprland" nests a private Hyprland inside a headless host compositor
+    # (see _hyprland_block); "kwin" runs kwin_wayland --virtual directly.
+    compositor: CompositorName = "kwin"
 
 
 def _write_deterministic_session_config(config_dir: Path) -> None:
@@ -102,6 +108,114 @@ def _write_deterministic_session_config(config_dir: Path) -> None:
     (config_dir / "kwalletrc").write_text(
         "[Wallet]\nEnabled=false\nFirst Use=false\nLaunch Manager=false\n"
     )
+
+
+# ── Virtual Hyprland ─────────────────────────────────────────────────────
+#
+# Hyprland's Aquamarine backend has no standalone headless mode: without a
+# parent Wayland display it insists on a DRM device. A virtual Hyprland
+# session therefore nests Hyprland, as a Wayland client, inside a private
+# headless host compositor on the session's own bus and socket. The host only
+# provides the output Hyprland renders into; apps, input, screenshots and
+# window management all talk to Hyprland. DRM and libinput are denied to
+# Hyprland (AQ_DRM_DEVICES, LIBSEAT_BACKEND=noop) so it can never take a
+# device of the real seat.
+
+HYPRLAND_HOST_ENV = "KWIN_MCP_HYPRLAND_HOST"
+_HYPRLAND_HOSTS = ("kwin", "weston")
+# Hyprland 0.56 switched to Lua configs; older releases only read hyprlang.
+_HYPRLAND_LUA_SINCE = (0, 56)
+_HYPRLAND_VERSION = re.compile(r"Hyprland\s+v?(\d+)\.(\d+)")
+_HYPRLAND_READY_TIMEOUT = 30
+
+
+def hyprland_host() -> str:
+    """The headless host compositor a virtual Hyprland session nests in.
+
+    ``KWIN_MCP_HYPRLAND_HOST`` (``kwin`` or ``weston``) picks one explicitly;
+    otherwise ``kwin_wayland`` is preferred, then ``weston``.
+    """
+    requested = os.environ.get(HYPRLAND_HOST_ENV, "")
+    if requested:
+        if requested not in _HYPRLAND_HOSTS:
+            hosts = ", ".join(_HYPRLAND_HOSTS)
+            msg = f"{HYPRLAND_HOST_ENV} must be one of {hosts}, got {requested!r}"
+            raise RuntimeError(msg)
+        return requested
+    if shutil.which("kwin_wayland"):
+        return "kwin"
+    if shutil.which("weston"):
+        return "weston"
+    msg = (
+        "A virtual Hyprland session needs a headless host compositor to nest in: "
+        "install kwin_wayland (KDE) or weston (e.g. 'sudo pacman -S weston')."
+    )
+    raise RuntimeError(msg)
+
+
+def _hyprland_version() -> tuple[int, int] | None:
+    """``(major, minor)`` of the installed Hyprland, or None when unknown."""
+    try:
+        result = subprocess.run(
+            ["Hyprland", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = _HYPRLAND_VERSION.search(result.stdout)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def write_hyprland_config(config_dir: Path, width: int, height: int) -> Path:
+    """Write the private Hyprland's config and return its path.
+
+    One output of exactly the session's size at scale 1, a US keymap (the
+    layout input.py's keycode tables assume), click-to-focus like KWin, no
+    animations (frames show settled state), no Xwayland (like the virtual
+    KWin session) and none of the first-run popups that would steal focus.
+    """
+    if shutil.which("Hyprland") is None:
+        msg = "Hyprland not found. Install Hyprland (e.g. 'sudo pacman -S hyprland')."
+        raise RuntimeError(msg)
+    hypr_dir = config_dir / "hypr"
+    hypr_dir.mkdir(parents=True, exist_ok=True)
+    version = _hyprland_version()
+    if version is None or version >= _HYPRLAND_LUA_SINCE:
+        path = hypr_dir / "kwin-mcp.lua"
+        path.write_text(
+            f'hl.monitor({{ output = "", mode = "{width}x{height}@60", '
+            'position = "0x0", scale = 1 })\n'
+            "hl.config({\n"
+            '    input = { kb_layout = "us", kb_variant = "", kb_options = "",\n'
+            "              follow_mouse = 2 },\n"
+            "    animations = { enabled = false },\n"
+            "    misc = {\n"
+            "        disable_hyprland_logo = true,\n"
+            "        disable_splash_rendering = true,\n"
+            "        disable_autoreload = true,\n"
+            "        disable_hyprland_guiutils_check = true,\n"
+            "        disable_watchdog_warning = true,\n"
+            "    },\n"
+            "    ecosystem = { no_update_news = true, no_donation_nag = true },\n"
+            "    xwayland = { enabled = false },\n"
+            "})\n"
+        )
+        return path
+    path = hypr_dir / "kwin-mcp.conf"
+    path.write_text(
+        f"monitor = ,{width}x{height}@60,0x0,1\n"
+        "input {\n    kb_layout = us\n    follow_mouse = 2\n}\n"
+        "animations {\n    enabled = false\n}\n"
+        "misc {\n    disable_hyprland_logo = true\n    disable_splash_rendering = true\n"
+        "    disable_autoreload = true\n}\n"
+        "ecosystem {\n    no_update_news = true\n    no_donation_nag = true\n}\n"
+        "xwayland {\n    enabled = false\n}\n"
+    )
+    return path
 
 
 @dataclass
@@ -129,6 +243,8 @@ class SessionInfo:
     # Degraded-but-running conditions reported by the startup wrapper, such as
     # a failed AT-SPI bus activation. The session is usable; callers surface these.
     startup_warnings: list[str] = field(default_factory=list)
+    # The compositor the session drives and how to reach it.
+    compositor: CompositorTarget = field(default_factory=CompositorTarget)
 
 
 def _remove_tree(path: Path, attempts: int = 3) -> None:
@@ -671,6 +787,13 @@ class Session:
         # stop() after the diagnostics it holds were consumed.
         self._stderr_file: IO[bytes] | None = None
         self._session_config_dir: Path | None = None
+        # Virtual Hyprland only: the host compositor's socket, the Hyprland
+        # config and host the wrapper starts, and the KEY=value lines the
+        # wrapper reports once Hyprland is up (its signature and socket).
+        self._host_socket: str = ""
+        self._hyprland_config: Path | None = None
+        self._hyprland_host: str = ""
+        self._handshake: dict[str, str] = {}
 
     @property
     def is_running(self) -> bool:
@@ -718,8 +841,15 @@ class Session:
         if config is None:
             config = SessionConfig()
         self._config = config
+        hyprland = config.compositor == "hyprland"
+        self._handshake = {}
+        # Resolved before anything is created, so a missing host leaves nothing behind.
+        self._hyprland_host = hyprland_host() if hyprland else ""
 
         self._socket_name = config.socket_name or f"wayland-mcp-{os.getpid()}-{int(time.time())}"
+        # Hyprland picks its own socket name (it is reported in the handshake);
+        # the chosen name goes to the host compositor it nests in.
+        self._host_socket = f"{self._socket_name}-host" if hyprland else ""
 
         # home="isolated": launched apps get a private temporary HOME.
         if config.home == "isolated":
@@ -741,9 +871,7 @@ class Session:
 
         # Clean up any stale socket files
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-        for suffix in ("", ".lock"):
-            path = Path(runtime_dir) / f"{self._socket_name}{suffix}"
-            path.unlink(missing_ok=True)
+        self._remove_socket_files(runtime_dir)
 
         # The compositor must not read the host's config dir: a wallet-enabled
         # kwalletrc there lets the kwallet popup steal focus from the app under
@@ -751,11 +879,20 @@ class Session:
         # that one, otherwise create a throwaway dir that _build_env points
         # XDG_CONFIG_HOME at. The keymap is pinned separately in _build_env.
         if self._home_dir is not None:
-            _write_deterministic_session_config(self._home_dir / ".config")
+            config_dir = self._home_dir / ".config"
         else:
             self._session_config_dir = Path(tempfile.mkdtemp(prefix="kwin-mcp-config-"))
-            _write_deterministic_session_config(self._session_config_dir)
+            config_dir = self._session_config_dir
             process_registry.register_temp_dir(self._session_config_dir)
+        _write_deterministic_session_config(config_dir)
+        if hyprland:
+            try:
+                self._hyprland_config = write_hyprland_config(
+                    config_dir, config.screen_width, config.screen_height
+                )
+            except BaseException:
+                self._cleanup_start_dirs()
+                raise
         # Deliberately NOT isolating XDG_DATA_HOME / XDG_CACHE_HOME: qtbase
         # crash-logs a fatal qFatal when a nonexistent standard data dir is
         # set (reproduced on qt6-base 6.10), and existing dirs already
@@ -790,7 +927,7 @@ class Session:
             # resource acquisition this method already performed.
             self._cleanup_start_dirs()
             raise
-        progress.report(1, progress_total, "Starting KWin")
+        progress.report(1, progress_total, f"Starting {self._compositor_label}")
 
         # Read startup output from the wrapper script.
         # Expected lines: DBUS_SESSION_BUS_ADDRESS=..., READY or FAILED.
@@ -798,7 +935,9 @@ class Session:
         # "WARN: " lines additionally reach the caller of a successful start.
         dbus_address, got_ready, stdout_tail = self._read_startup_output(progress_total)
         if got_ready:
-            progress.report(2, progress_total, "KWin ready")
+            progress.report(2, progress_total, f"{self._compositor_label} ready")
+        if hyprland and self._handshake.get("WAYLAND_DISPLAY"):
+            self._socket_name = self._handshake["WAYLAND_DISPLAY"]
 
         # Wait for kwin to be ready (socket file appears). Without READY the
         # start has already failed, so only probe the socket to pick the error
@@ -808,11 +947,27 @@ class Session:
             socket_ready = self._wait_for_socket(socket_path, timeout=10.0)
         else:
             socket_ready = socket_path.exists()
+        target = (
+            CompositorTarget(
+                name="hyprland",
+                hyprland_signature=self._handshake.get(HYPRLAND_SIGNATURE_ENV, ""),
+                runtime_dir=runtime_dir,
+            )
+            if hyprland
+            else CompositorTarget()
+        )
         reason = None
         if not socket_ready:
-            reason = "KWin failed to start"
+            reason = f"{self._compositor_label} failed to start"
         elif not got_ready:
             reason = "Session setup failed: did not receive READY signal"
+        elif hyprland:
+            from kwin_mcp import hyprland as hyprland_ipc
+
+            try:
+                hyprland_ipc.size_outputs(config.screen_width, config.screen_height, target)
+            except RuntimeError as exc:
+                reason = f"Hyprland did not take the requested screen size ({exc})"
         if reason is not None:
             try:
                 # The session is failed but may still hold children; terminate
@@ -864,8 +1019,23 @@ class Session:
                 for line in stdout_tail.splitlines()
                 if line.startswith("WARN: ")
             ],
+            compositor=target,
         )
         return self._info
+
+    @property
+    def _compositor_label(self) -> str:
+        if self._config is not None and self._config.compositor == "hyprland":
+            return "Hyprland"
+        return "KWin"
+
+    def _remove_socket_files(self, runtime_dir: str) -> None:
+        """Remove the session's (and a Hyprland host's) Wayland socket and lock files."""
+        for name in (self._socket_name, self._host_socket):
+            if not name:
+                continue
+            for suffix in ("", ".lock"):
+                (Path(runtime_dir) / f"{name}{suffix}").unlink(missing_ok=True)
 
     def launch_app(self, command: list[str], extra_env: dict[str, str] | None = None) -> AppInfo:
         """Launch an application inside the isolated session.
@@ -889,6 +1059,13 @@ class Session:
         # virtual compositor starts no Xwayland, so there is no session-local
         # value to substitute. An explicit extra_env DISPLAY still applies.
         env.pop("DISPLAY", None)
+        # Likewise the host's Hyprland instance: hyprctl and Hyprland-aware apps
+        # must reach the session's own Hyprland, or none at all.
+        env.pop(HYPRLAND_SIGNATURE_ENV, None)
+        signature = self._info.compositor.hyprland_signature
+        if signature:
+            env[HYPRLAND_SIGNATURE_ENV] = signature
+            env["XDG_CURRENT_DESKTOP"] = "Hyprland"
         if extra_env:
             env.update(extra_env)
         if self._info.dbus_address:
@@ -1011,9 +1188,12 @@ class Session:
 
         # Clean up socket files
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-        for suffix in ("", ".lock"):
-            path = Path(runtime_dir) / f"{self._socket_name}{suffix}"
-            path.unlink(missing_ok=True)
+        self._remove_socket_files(runtime_dir)
+        signature = self._handshake.get(HYPRLAND_SIGNATURE_ENV, "")
+        if signature and "/" not in signature:
+            # Hyprland removes its IPC dir on a clean exit; a killed one leaves it.
+            shutil.rmtree(Path(runtime_dir) / "hypr" / signature, ignore_errors=True)
+        self._handshake = {}
 
         # Remove the per-session config dir
         if self._session_config_dir is not None:
@@ -1114,7 +1294,7 @@ class Session:
             progress.report(
                 1 + min(elapsed / _STARTUP_READ_TIMEOUT, 0.99),
                 progress_total,
-                f"Waiting for KWin ({elapsed:.0f}s)",
+                f"Waiting for {self._compositor_label} ({elapsed:.0f}s)",
             )
             if not readable:
                 # No complete line can arrive any more once the leader is gone;
@@ -1140,6 +1320,9 @@ class Session:
                 text = line.decode(errors="replace").strip()
                 if text.startswith("DBUS_SESSION_BUS_ADDRESS="):
                     dbus_address = text.split("=", 1)[1]
+                elif text.startswith((f"{HYPRLAND_SIGNATURE_ENV}=", "WAYLAND_DISPLAY=")):
+                    key, value = text.split("=", 1)
+                    self._handshake[key] = value
                 elif text == "READY":
                     got_ready = True
                 elif text:
@@ -1189,9 +1372,16 @@ class Session:
             if direct_start
             else f"; set {ATSPI_DIRECT_START_ENV}=1 to start it directly from its service files"
         )
+        compositor_block = (
+            self._hyprland_block(config)
+            if config.compositor == "hyprland"
+            else self._kwin_block(config)
+        )
         return f"""\
 # Keep every background child in the registered group, even with inherited monitor mode.
 set +m
+# Set only by a virtual Hyprland session; never inherited from the environment.
+HOST_PID=
 echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
 
 # Ensure all child processes are cleaned up on exit.
@@ -1200,10 +1390,10 @@ echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
 # (dbus-run-session tears the bus down on parent exit). When activation is
 # denied and the direct start is enabled, they are started directly as children
 # of this script, in its process group, which session_stop signals as a whole.
-# Only KWin is tracked here.
+# Only the compositor (and a virtual Hyprland's host compositor) is tracked here.
 cleanup() {{
-    kill $KWIN_PID 2>/dev/null
-    wait $KWIN_PID 2>/dev/null
+    kill $KWIN_PID $HOST_PID 2>/dev/null
+    wait $KWIN_PID $HOST_PID 2>/dev/null
 }}
 trap cleanup EXIT TERM INT HUP
 
@@ -1335,6 +1525,106 @@ if [ "$ATSPI_UP" = 1 ] && ! ATSPI_ERR=$(dbus-send --session --print-reply --repl
         "(such as Firefox) may expose no accessibility tree: ${{ATSPI_ERR:-unknown error}}"
 fi
 
+{compositor_block}"""
+
+    def _hyprland_host_command(self, config: SessionConfig) -> str:
+        """The shell command that starts the headless host compositor."""
+        width, height, socket_name = config.screen_width, config.screen_height, self._host_socket
+        if self._hyprland_host == "weston":
+            return (
+                "weston --backend=headless --renderer=gl --idle-time=0 "
+                f"--width={width} --height={height} --socket={shlex.quote(socket_name)}"
+            )
+        return (
+            "env -u KDE_FULL_SESSION -u KDE_SESSION_VERSION "
+            "kwin_wayland --virtual --no-lockscreen "
+            f"--width {width} --height {height} --socket {shlex.quote(socket_name)}"
+        )
+
+    def _hyprland_block(self, config: SessionConfig) -> str:
+        """The wrapper's tail for a virtual Hyprland session.
+
+        Starts the headless host, then Hyprland as its client, waits until
+        Hyprland's lock file names this Hyprland's pid and its IPC socket
+        answers, and reports the instance signature and Wayland socket
+        Hyprland chose before READY.
+        """
+        host = self._hyprland_host_command(config)
+        host_socket = shlex.quote(self._host_socket)
+        hypr_config = shlex.quote(str(self._hyprland_config))
+        timeout = int(_HYPRLAND_READY_TIMEOUT)
+        return f"""\
+# The host compositor only provides the output Hyprland renders into. Neither
+# may connect to another compositor as a client, so WAYLAND_DISPLAY is dropped.
+env -u WAYLAND_DISPLAY -u DISPLAY -u {HYPRLAND_SIGNATURE_ENV} {host} &
+HOST_PID=$!
+for _ in $(seq 1 300); do
+    [ -e "$XDG_RUNTIME_DIR/{self._host_socket}" ] && break
+    kill -0 $HOST_PID 2>/dev/null || break
+    sleep 0.1
+done
+if [ ! -e "$XDG_RUNTIME_DIR/{self._host_socket}" ]; then
+    echo "FAILED"
+    echo "{self._hyprland_host} exited before creating the host socket {self._host_socket}" >&2
+    exit 1
+fi
+
+# Hyprland runs as a client of the host. AQ_DRM_DEVICES and the noop seat keep
+# it away from every DRM and input device of the real seat, so it can only use
+# the host's Wayland output and the input kwin-mcp injects.
+env -u DISPLAY -u {HYPRLAND_SIGNATURE_ENV} WAYLAND_DISPLAY={host_socket} \\
+    AQ_DRM_DEVICES=/nonexistent LIBSEAT_BACKEND=noop \\
+    HYPRLAND_NO_SD_NOTIFY=1 HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_RT=1 HYPRLAND_NO_CRASHREPORTER=1 \\
+    Hyprland --config {hypr_config} &
+KWIN_PID=$!
+
+# Hyprland picks its own instance signature and Wayland socket and writes both
+# (with its pid) to hypr/<signature>/hyprland.lock. Match the lock by pid, then
+# wait for the IPC socket; give up when Hyprland dies or after {timeout}s.
+HYPR_DIR=
+HYPR_SOCKET=
+HYPR_DEADLINE=$((SECONDS + {timeout}))
+while [ "$SECONDS" -lt "$HYPR_DEADLINE" ]; do
+    kill -0 $KWIN_PID 2>/dev/null || break
+    for lock in "$XDG_RUNTIME_DIR"/hypr/*/hyprland.lock; do
+        [ -f "$lock" ] || continue
+        if [ "$(sed -n 1p "$lock")" = "$KWIN_PID" ]; then
+            HYPR_DIR=${{lock%/hyprland.lock}}
+            HYPR_SOCKET=$(sed -n 2p "$lock")
+        fi
+    done
+    if [ -n "$HYPR_SOCKET" ] && [ -S "$HYPR_DIR/.socket.sock" ] \\
+        && [ -S "$XDG_RUNTIME_DIR/$HYPR_SOCKET" ]; then
+        break
+    fi
+    sleep 0.1
+done
+if [ -z "$HYPR_SOCKET" ] || [ ! -S "$HYPR_DIR/.socket.sock" ]; then
+    echo "FAILED"
+    if ! kill -0 $KWIN_PID 2>/dev/null; then
+        echo "Hyprland exited before opening its IPC socket" >&2
+    else
+        echo "Hyprland did not open its IPC socket within {timeout}s" >&2
+    fi
+    exit 1
+fi
+HYPR_SIGNATURE=${{HYPR_DIR##*/}}
+echo "{HYPRLAND_SIGNATURE_ENV}=$HYPR_SIGNATURE"
+echo "WAYLAND_DISPLAY=$HYPR_SOCKET"
+
+# D-Bus-activated services (portals, AT-SPI) must reach Hyprland, not the host.
+dbus-update-activation-environment WAYLAND_DISPLAY="$HYPR_SOCKET" \\
+    {HYPRLAND_SIGNATURE_ENV}="$HYPR_SIGNATURE" XDG_CURRENT_DESKTOP=Hyprland QT_QPA_PLATFORM=wayland
+
+echo "READY"
+
+# Block until Hyprland exits
+wait $KWIN_PID
+"""
+
+    def _kwin_block(self, config: SessionConfig) -> str:
+        """The wrapper's tail for a virtual KWin session: start KWin, wait, READY."""
+        return f"""\
 # Pre-set D-Bus activation environment BEFORE starting KWin.
 # When KWin triggers portal auto-activation, portal-kde will get
 # WAYLAND_DISPLAY pointing to our isolated compositor socket.
@@ -1440,6 +1730,11 @@ wait $KWIN_PID
         # Remove host display references to avoid kwin connecting to host
         env.pop("WAYLAND_DISPLAY", None)
         env.pop("DISPLAY", None)
+        env.pop(HYPRLAND_SIGNATURE_ENV, None)
+        if config.compositor == "hyprland":
+            env.pop("KDE_FULL_SESSION", None)
+            env.pop("KDE_SESSION_VERSION", None)
+            env["XDG_CURRENT_DESKTOP"] = "Hyprland"
 
         env.update(self._xdg_isolation_env())
         # Without an isolated home, point the compositor at the per-session
@@ -1574,11 +1869,12 @@ def set_accessibility_enabled(dbus_address: str, enabled: bool) -> None:
 
 
 class LiveSession:
-    """Connection to an existing (non-virtual) KWin session.
+    """Connection to an existing (non-virtual) KWin or Hyprland session.
 
-    Attaches to a KWin compositor that is already running, such as
-    the user's real desktop or a KWin instance inside a container.
-    Does NOT manage the compositor lifecycle — stop() only disconnects.
+    Attaches to a compositor that is already running, such as the user's
+    real desktop (KDE Plasma, Hyprland, Omarchy) or a KWin instance inside a
+    container. Does NOT manage the compositor lifecycle — stop() only
+    disconnects.
     """
 
     def __init__(
@@ -1587,8 +1883,9 @@ class LiveSession:
         wayland_socket: str,
         screenshot_dir: Path,
         retention: Retention = NO_RETENTION,
+        compositor: CompositorTarget | None = None,
     ) -> None:
-        """Attach to a running KWin.
+        """Attach to a running compositor (``compositor`` defaults to KWin).
 
         ``retention`` is decided here, at connect: only ``retention.artifacts``
         applies (a live session has no isolated home). The caller registers
@@ -1601,6 +1898,7 @@ class LiveSession:
             kwin_pid=0,
             screenshot_dir=screenshot_dir,
             session_type=SessionType.LIVE,
+            compositor=compositor or CompositorTarget(),
         )
         self._running = True
         self._app_counter: int = 0
@@ -1648,6 +1946,9 @@ class LiveSession:
         }
         if self._info.dbus_address:
             env["DBUS_SESSION_BUS_ADDRESS"] = self._info.dbus_address
+        signature = self._info.compositor.hyprland_signature
+        if signature:
+            env[HYPRLAND_SIGNATURE_ENV] = signature
         if extra_env:
             env.update(extra_env)
 
