@@ -7,7 +7,7 @@ detection must find it from its lock file alone. Zenity's entry dialog is the
 probe: typed text is read back over AT-SPI2, and clicking OK prints it to the
 app log.
 
-Needs Hyprland, ``grim``, ``zenity`` and ``kwin_wayland`` or ``weston``; the
+Needs Hyprland, ``grim``, ``zenity`` and ``kwin_wayland``; the
 KWin E2E images have none of the first three, so they skip as a known limit.
 """
 
@@ -37,9 +37,8 @@ ZENITY = "zenity --entry --title=Probe --text=Name"
 @pytest.fixture
 def hyprland_engine(engine: AutomationEngine) -> AutomationEngine:
     """An engine running a virtual Hyprland session at WIDTH x HEIGHT."""
-    missing = [tool for tool in ("Hyprland", "grim", "zenity") if shutil.which(tool) is None] + (
-        [] if shutil.which("kwin_wayland") or shutil.which("weston") else ["a headless host"]
-    )
+    tools = ("Hyprland", "grim", "zenity", "kwin_wayland")
+    missing = [tool for tool in tools if shutil.which(tool) is None]
     if missing:
         require_or_skip("hyprland", f"Hyprland is not installed (missing {missing})", os.environ)
     engine.session_start(screen_width=WIDTH, screen_height=HEIGHT, compositor="hyprland")

@@ -364,23 +364,16 @@ def test_hyprland_config_matches_the_installed_version(
     assert "xwayland" in text
 
 
-def test_hyprland_host_honours_the_override(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(session.HYPRLAND_HOST_ENV, "weston")
-    assert session.hyprland_host() == "weston"
-    monkeypatch.setenv(session.HYPRLAND_HOST_ENV, "sway")
-    with pytest.raises(RuntimeError, match="must be one of kwin, weston"):
-        session.hyprland_host()
-    monkeypatch.delenv(session.HYPRLAND_HOST_ENV)
+def test_virtual_hyprland_requires_a_kwin_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(session.shutil, "which", lambda _name: None)
-    with pytest.raises(RuntimeError, match="headless host compositor"):
-        session.hyprland_host()
+    with pytest.raises(RuntimeError, match="kwin_wayland --virtual"):
+        session.require_hyprland_host()
 
 
 def test_hyprland_wrapper_keeps_hyprland_off_the_real_seat(tmp_path: Path) -> None:
     virtual = session.Session()
     virtual._socket_name = "wayland-mcp-1"
     virtual._host_socket = "wayland-mcp-1-host"
-    virtual._hyprland_host = "kwin"
     virtual._hyprland_config = tmp_path / "hypr" / "kwin-mcp.lua"
     config = session.SessionConfig(screen_width=1280, screen_height=800, compositor="hyprland")
     script = virtual._build_wrapper_script(config)

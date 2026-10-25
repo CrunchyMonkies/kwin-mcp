@@ -526,7 +526,7 @@ kwin-mcp also drives [Hyprland](https://hypr.land/), including [Omarchy](https:/
 | Area | KWin | Hyprland |
 |------|------|----------|
 | Live desktop | `session_connect` | `session_connect`, detected from `HYPRLAND_INSTANCE_SIGNATURE`, or from the Hyprland instance whose `hyprland.lock` names the `wayland_display` you connect to |
-| Virtual session | `session_start` | `session_start(compositor="hyprland")`: a private Hyprland nested in a headless host compositor (`kwin_wayland --virtual`, else `weston --backend=headless`; force one with `KWIN_MCP_HYPRLAND_HOST=kwin\|weston`) |
+| Virtual session | `session_start` | `session_start(compositor="hyprland")`: a private Hyprland nested in a headless `kwin_wayland --virtual` (Hyprland 0.56 rejects weston and wlroots hosts such as sway, which lack the protocol versions it requires) |
 | Windows and desktops | KWin scripting over D-Bus | Hyprland IPC socket (no `hyprctl` binary needed); desktops are workspaces, addressed by workspace id (special workspaces have negative ids) |
 | Input | KWin EIS (libei) | `zwlr_virtual_pointer_v1` and `zwp_virtual_keyboard_v1`, with a US keymap uploaded for the virtual keyboard only. There is no touch |
 | Screenshots | ScreenShot2, Spectacle | `grim` (wlr-screencopy) |
@@ -552,8 +552,8 @@ Install the Hyprland runtime packages on Arch or Omarchy:
 
 ```bash
 sudo pacman -S --needed grim at-spi2-core python-gobject libxkbcommon wl-clipboard wtype
-# Only for session_start(compositor="hyprland"): a headless host compositor
-sudo pacman -S --needed weston
+# Only for session_start(compositor="hyprland"): the headless host compositor
+sudo pacman -S --needed kwin
 ```
 
 ## System Requirements

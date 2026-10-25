@@ -115,42 +115,32 @@ def _write_deterministic_session_config(config_dir: Path) -> None:
 # Hyprland's Aquamarine backend has no standalone headless mode: without a
 # parent Wayland display it insists on a DRM device. A virtual Hyprland
 # session therefore nests Hyprland, as a Wayland client, inside a private
-# headless host compositor on the session's own bus and socket. The host only
-# provides the output Hyprland renders into; apps, input, screenshots and
+# headless kwin_wayland --virtual on the session's own bus and socket. The host
+# only provides the output Hyprland renders into; apps, input, screenshots and
 # window management all talk to Hyprland. DRM and libinput are denied to
 # Hyprland (AQ_DRM_DEVICES, LIBSEAT_BACKEND=noop) so it can never take a
 # device of the real seat.
+#
+# KWin is the only host: Hyprland 0.56's nested backend requires
+# wl_compositor and xdg_wm_base version 6, which weston 15 and wlroots-based
+# compositors (sway 1.12, cage) do not offer, so Hyprland exits at startup in
+# them.
 
-HYPRLAND_HOST_ENV = "KWIN_MCP_HYPRLAND_HOST"
-_HYPRLAND_HOSTS = ("kwin", "weston")
 # Hyprland 0.56 switched to Lua configs; older releases only read hyprlang.
 _HYPRLAND_LUA_SINCE = (0, 56)
 _HYPRLAND_VERSION = re.compile(r"Hyprland\s+v?(\d+)\.(\d+)")
 _HYPRLAND_READY_TIMEOUT = 30
 
 
-def hyprland_host() -> str:
-    """The headless host compositor a virtual Hyprland session nests in.
-
-    ``KWIN_MCP_HYPRLAND_HOST`` (``kwin`` or ``weston``) picks one explicitly;
-    otherwise ``kwin_wayland`` is preferred, then ``weston``.
-    """
-    requested = os.environ.get(HYPRLAND_HOST_ENV, "")
-    if requested:
-        if requested not in _HYPRLAND_HOSTS:
-            hosts = ", ".join(_HYPRLAND_HOSTS)
-            msg = f"{HYPRLAND_HOST_ENV} must be one of {hosts}, got {requested!r}"
-            raise RuntimeError(msg)
-        return requested
-    if shutil.which("kwin_wayland"):
-        return "kwin"
-    if shutil.which("weston"):
-        return "weston"
-    msg = (
-        "A virtual Hyprland session needs a headless host compositor to nest in: "
-        "install kwin_wayland (KDE) or weston (e.g. 'sudo pacman -S weston')."
-    )
-    raise RuntimeError(msg)
+def require_hyprland_host() -> None:
+    """Fail unless ``kwin_wayland``, the headless host a virtual Hyprland nests in, exists."""
+    if shutil.which("kwin_wayland") is None:
+        msg = (
+            "A virtual Hyprland session nests Hyprland in a headless kwin_wayland --virtual: "
+            "install kwin (e.g. 'sudo pacman -S kwin'). weston and wlroots compositors such "
+            "as sway lack the Wayland protocol versions Hyprland 0.56 requires of a host."
+        )
+        raise RuntimeError(msg)
 
 
 def _hyprland_version() -> tuple[int, int] | None:
@@ -788,11 +778,10 @@ class Session:
         self._stderr_file: IO[bytes] | None = None
         self._session_config_dir: Path | None = None
         # Virtual Hyprland only: the host compositor's socket, the Hyprland
-        # config and host the wrapper starts, and the KEY=value lines the
-        # wrapper reports once Hyprland is up (its signature and socket).
+        # config the wrapper starts, and the KEY=value lines the wrapper
+        # reports once Hyprland is up (its signature and socket).
         self._host_socket: str = ""
         self._hyprland_config: Path | None = None
-        self._hyprland_host: str = ""
         self._handshake: dict[str, str] = {}
 
     @property
@@ -843,8 +832,9 @@ class Session:
         self._config = config
         hyprland = config.compositor == "hyprland"
         self._handshake = {}
-        # Resolved before anything is created, so a missing host leaves nothing behind.
-        self._hyprland_host = hyprland_host() if hyprland else ""
+        # Checked before anything is created, so a missing host leaves nothing behind.
+        if hyprland:
+            require_hyprland_host()
 
         self._socket_name = config.socket_name or f"wayland-mcp-{os.getpid()}-{int(time.time())}"
         # Hyprland picks its own socket name (it is reported in the handshake);
@@ -1527,29 +1517,20 @@ fi
 
 {compositor_block}"""
 
-    def _hyprland_host_command(self, config: SessionConfig) -> str:
-        """The shell command that starts the headless host compositor."""
-        width, height, socket_name = config.screen_width, config.screen_height, self._host_socket
-        if self._hyprland_host == "weston":
-            return (
-                "weston --backend=headless --renderer=gl --idle-time=0 "
-                f"--width={width} --height={height} --socket={shlex.quote(socket_name)}"
-            )
-        return (
-            "env -u KDE_FULL_SESSION -u KDE_SESSION_VERSION "
-            "kwin_wayland --virtual --no-lockscreen "
-            f"--width {width} --height {height} --socket {shlex.quote(socket_name)}"
-        )
-
     def _hyprland_block(self, config: SessionConfig) -> str:
         """The wrapper's tail for a virtual Hyprland session.
 
-        Starts the headless host, then Hyprland as its client, waits until
+        Starts the headless kwin_wayland host, then Hyprland as its client, waits until
         Hyprland's lock file names this Hyprland's pid and its IPC socket
         answers, and reports the instance signature and Wayland socket
         Hyprland chose before READY.
         """
-        host = self._hyprland_host_command(config)
+        host = (
+            "env -u KDE_FULL_SESSION -u KDE_SESSION_VERSION "
+            "kwin_wayland --virtual --no-lockscreen "
+            f"--width {config.screen_width} --height {config.screen_height} "
+            f"--socket {shlex.quote(self._host_socket)}"
+        )
         host_socket = shlex.quote(self._host_socket)
         hypr_config = shlex.quote(str(self._hyprland_config))
         timeout = int(_HYPRLAND_READY_TIMEOUT)
@@ -1565,7 +1546,7 @@ for _ in $(seq 1 300); do
 done
 if [ ! -e "$XDG_RUNTIME_DIR/{self._host_socket}" ]; then
     echo "FAILED"
-    echo "{self._hyprland_host} exited before creating the host socket {self._host_socket}" >&2
+    echo "kwin_wayland exited before creating the host socket {self._host_socket}" >&2
     exit 1
 fi
 
