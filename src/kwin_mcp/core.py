@@ -1014,6 +1014,17 @@ class AutomationEngine:
 
         dbus_addr = dbus_address or os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
         wayland_disp = wayland_display or os.environ.get("WAYLAND_DISPLAY", "")
+        # A server started outside the desktop (a service, an IDE backend) may
+        # have neither; find the desktop the user is running instead.
+        discovered: list[str] = []
+        if not dbus_addr:
+            dbus_addr = compositor.discover_session_bus()
+            if dbus_addr:
+                discovered.append(f"session bus {dbus_addr}")
+        if not wayland_disp:
+            wayland_disp = compositor.discover_live_display()
+            if wayland_disp:
+                discovered.append(f"Wayland display {wayland_disp}")
 
         if not dbus_addr:
             msg = (
@@ -1023,8 +1034,9 @@ class AutomationEngine:
             raise RuntimeError(msg)
         if not wayland_disp:
             msg = (
-                "No Wayland display available. Provide wayland_display parameter "
-                "or ensure $WAYLAND_DISPLAY is set."
+                "No Wayland display available: $WAYLAND_DISPLAY is not set and no running "
+                "desktop socket was found in $XDG_RUNTIME_DIR.\n"
+                "Provide the wayland_display parameter (e.g. wayland-0 or wayland-1)."
             )
             raise RuntimeError(msg)
 
@@ -1099,6 +1111,11 @@ class AutomationEngine:
         self._clipboard_enabled = True
 
         warnings: list[str] = []
+        if discovered:
+            warnings.append(
+                f"Found the running desktop's {' and '.join(discovered)} (not set in the "
+                "server's environment); pass dbus_address/wayland_display to pick another"
+            )
         # The check above already found org.kde.KWin owned (or Hyprland's IPC
         # answering), so no settle delay is needed before the input connection.
         try:

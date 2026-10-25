@@ -606,10 +606,17 @@ def session_start(
 def session_connect(
     engine: AutomationEngine,
     dbus_address: Annotated[
-        str, Field(description="Session bus address; empty = $DBUS_SESSION_BUS_ADDRESS.")
+        str,
+        Field(
+            description="Session bus address; empty = $DBUS_SESSION_BUS_ADDRESS, "
+            "else $XDG_RUNTIME_DIR/bus."
+        ),
     ] = "",
     wayland_display: Annotated[
-        str, Field(description="Socket name or path; empty = $WAYLAND_DISPLAY.")
+        str,
+        Field(
+            description="Socket name or path; empty = $WAYLAND_DISPLAY, else the running desktop's."
+        ),
     ] = "",
     enable_accessibility: Annotated[
         bool,

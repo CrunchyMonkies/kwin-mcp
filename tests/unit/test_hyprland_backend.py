@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import subprocess
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -148,6 +150,63 @@ def test_detect_live_finds_the_instance_serving_the_socket(tmp_path: Path) -> No
     assert compositor.detect_live(env, str(tmp_path / "wayland-2")).hyprland_signature == "other"
     assert compositor.detect_live(env, "wayland-9") == compositor.KWIN
     assert compositor.detect_live(env) == compositor.KWIN
+
+
+def _listen(path: Path) -> socket.socket:
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen()
+    return server
+
+
+def _lock(base: Path, signature: str, pid: int, socket_name: str) -> None:
+    lock = base / "hypr" / signature / "hyprland.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(f"{pid}\n{socket_name}\n")
+
+
+def test_discovery_prefers_the_login_hyprland_over_virtual_ones(tmp_path: Path) -> None:
+    env = {"XDG_RUNTIME_DIR": str(tmp_path)}
+    servers = [_listen(tmp_path / name) for name in ("wayland-0", "wayland-1", "wayland-2")]
+    # A kwin-mcp virtual Hyprland: started with the marker in its environment.
+    virtual = subprocess.Popen(
+        ["sleep", "30"], env={**os.environ, "AQ_DRM_DEVICES": "/nonexistent"}
+    )
+    try:
+        _lock(tmp_path, "h_100_a", virtual.pid, "wayland-2")
+        _lock(tmp_path, "h_300_b", os.getpid(), "wayland-0")
+        _lock(tmp_path, "h_200_c", os.getpid(), "wayland-1")
+        assert compositor.discover_live_display(env) == "wayland-1"
+        signature_env = {**env, "HYPRLAND_INSTANCE_SIGNATURE": "h_300_b"}
+        assert compositor.discover_live_display(signature_env) == "wayland-0"
+    finally:
+        virtual.kill()
+        virtual.wait()
+        for server in servers:
+            server.close()
+
+
+def test_discovery_falls_back_to_the_lowest_live_wayland_socket(tmp_path: Path) -> None:
+    env = {"XDG_RUNTIME_DIR": str(tmp_path)}
+    assert compositor.discover_live_display(env) == ""
+    stale = _listen(tmp_path / "wayland-0")
+    stale.close()  # the file stays, nothing accepts
+    servers = [_listen(tmp_path / name) for name in ("wayland-mcp-1", "wayland-10", "wayland-2")]
+    try:
+        assert compositor.discover_live_display(env) == "wayland-2"
+    finally:
+        for server in servers:
+            server.close()
+
+
+def test_discovery_finds_the_user_bus(tmp_path: Path) -> None:
+    env = {"XDG_RUNTIME_DIR": str(tmp_path)}
+    assert compositor.discover_session_bus(env) == ""
+    bus = _listen(tmp_path / "bus")
+    try:
+        assert compositor.discover_session_bus(env) == f"unix:path={tmp_path}/bus"
+    finally:
+        bus.close()
 
 
 def test_request_without_signature_fails_clearly() -> None:

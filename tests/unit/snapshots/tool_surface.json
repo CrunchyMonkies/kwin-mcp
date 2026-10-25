@@ -199,12 +199,12 @@
    "properties": {
     "dbus_address": {
      "default": "",
-     "description": "Session bus address; empty = $DBUS_SESSION_BUS_ADDRESS.",
+     "description": "Session bus address; empty = $DBUS_SESSION_BUS_ADDRESS, else $XDG_RUNTIME_DIR/bus.",
      "type": "string"
     },
     "wayland_display": {
      "default": "",
-     "description": "Socket name or path; empty = $WAYLAND_DISPLAY.",
+     "description": "Socket name or path; empty = $WAYLAND_DISPLAY, else the running desktop's.",
      "type": "string"
     },
     "enable_accessibility": {
