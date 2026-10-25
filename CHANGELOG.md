@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hyprland support, including Omarchy desktops. `session_connect` detects a live Hyprland from `HYPRLAND_INSTANCE_SIGNATURE`, or from the instance whose `hyprland.lock` names the `wayland_display` being connected to. `session_start(compositor="hyprland")` starts an isolated Hyprland nested in a headless `kwin_wayland --virtual` (weston and wlroots compositors cannot host Hyprland 0.56). Windows, workspaces and outputs come from Hyprland's IPC socket, with Hyprland 0.56+ Lua and older hyprlang dispatcher syntax. Input goes through the `zwlr_virtual_pointer_v1` and `zwp_virtual_keyboard_v1` protocols with a private US keymap, and screenshots through `grim`. Touch input is not available on Hyprland.
 - `session_connect()` finds the running desktop when the server's environment lacks `$WAYLAND_DISPLAY` or `$DBUS_SESSION_BUS_ADDRESS` (a server started by a service or an IDE backend): `$XDG_RUNTIME_DIR/bus`, the login session's Hyprland (never a kwin-mcp virtual one), else the lowest-numbered connectable `wayland-N`. A warning names what was found.
 - `session_start` takes `compositor` (`"kwin"` by default). `SessionInfo` reports `compositor`, and `input_backend` can be `"virtual"` (Wayland virtual pointer/keyboard).
+- The Unicode clipboard fallback pastes with Ctrl+Shift+V into Omarchy's terminal-hosted TUIs (`org.omarchy.*`, `TUI.float`, `TUI.tile`).
 
 ### Fixed
 
