@@ -325,4 +325,22 @@ def test_topology_parses_hyprland_outputs(fake: FakeHyprland) -> None:
 # ── Input ────────────────────────────────────────────────────────────────
 
 
+def test_discrete_scroll_converts_120ths_to_detents(monkeypatch: pytest.MonkeyPatch) -> None:
+    from kwin_mcp import wayland_input
+
+    client = object.__new__(wayland_input.VirtualInputClient)
+    sent: list[tuple[int, list[tuple[str, Any]]]] = []
+    client._pointer = 1
+    client._started = 0.0
+    monkeypatch.setattr(
+        client, "_marshal", lambda _proxy, opcode, args: sent.append((opcode, args))
+    )
+    monkeypatch.setattr(client, "_pointer_frame", lambda: None)
+    client.pointer_scroll_discrete(0, -240)
+    discrete = [args for opcode, args in sent if opcode == wayland_input._OP_PTR_AXIS_DISCRETE]
+    assert discrete == [[("u", discrete[0][0][1]), ("u", 0), ("f", -30.0), ("i", -2)]]
+    with pytest.raises(RuntimeError, match="Touch input is not available on Hyprland"):
+        client.touch_down(1, 1)
+
+
 # ── Virtual session ──────────────────────────────────────────────────────

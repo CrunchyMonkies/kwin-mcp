@@ -36,6 +36,11 @@ from kwin_mcp.models import HeldInput, TypeRoute
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
+    from kwin_mcp.wayland_input import VirtualInputClient
+
+    # The two input transports InputBackend can drive; they share one method surface.
+    type InputClient = EISClient | VirtualInputClient
+
 # Longest uninterrupted sleep while holding a button or touch point, so a
 # long-press can report progress; the total hold duration is unchanged.
 _HOLD_SLICE_S = 0.5
@@ -1223,7 +1228,7 @@ def _is_are(count: int) -> str:
     return "is" if count == 1 else "are"
 
 
-def _lift_after_failure(client: EISClient, touch_ids: Iterable[int]) -> None:
+def _lift_after_failure(client: InputClient, touch_ids: Iterable[int]) -> None:
     """Lift touch points a failed gesture left down, keeping the original error."""
     for touch_id in touch_ids:
         with contextlib.suppress(RuntimeError, ValueError, OSError):
@@ -1238,9 +1243,14 @@ class InputBackend:
     buttons and keys the raw hold calls leave pressed.
     """
 
-    def __init__(self, dbus_address: str) -> None:
+    def __init__(self, dbus_address: str, client: InputClient | None = None) -> None:
+        """Drive ``client``, or connect to KWin's EIS on ``dbus_address`` when none is given.
+
+        A Hyprland session passes a ``wayland_input.VirtualInputClient``,
+        which offers the same methods as ``EISClient``.
+        """
         self._dbus_address = dbus_address
-        self._client = EISClient(dbus_address)
+        self._client: InputClient = EISClient(dbus_address) if client is None else client
         # Buttons pressed by mouse_button_down and not yet released, in press
         # order. While any is held, pointer motion is part of a drag path the
         # client records.
