@@ -90,6 +90,7 @@ from kwin_mcp.models import (
     ClipboardText,
     ClipboardWriteResult,
     CloseConsent,
+    Compositor,
     DbusReply,
     DesktopList,
     ElementActResult,
@@ -565,7 +566,7 @@ _RETENTION_DESCRIPTION = (
 )
 
 
-@_tool(title="Start virtual KWin session", annotations=_ND, gate=require_no_session)
+@_tool(title="Start virtual session", annotations=_ND, gate=require_no_session)
 def session_start(
     engine: AutomationEngine,
     screen_width: Annotated[
@@ -585,25 +586,37 @@ def session_start(
         ),
     ] = "host",
     retention: Annotated[Retention, Field(description=_RETENTION_DESCRIPTION)] = NO_RETENTION,
+    compositor: Annotated[
+        Compositor,
+        Field(description="kwin_wayland --virtual, or Hyprland nested in a headless host."),
+    ] = "kwin",
 ) -> SessionInfo:
-    """Start an isolated virtual KWin Wayland session (one at a time). Then launch apps with app_launch."""  # noqa: E501
+    """Start an isolated virtual KWin or Hyprland Wayland session (one at a time). Then launch apps with app_launch."""  # noqa: E501
     return engine.session_start(
         screen_width=screen_width,
         screen_height=screen_height,
         enable_clipboard=enable_clipboard,
         home=home,
         retention=retention,
+        compositor=compositor,
     )
 
 
-@_tool(title="Attach to live KDE desktop", annotations=_ND_OPEN, gate=require_no_session)
+@_tool(title="Attach to live desktop", annotations=_ND_OPEN, gate=require_no_session)
 def session_connect(
     engine: AutomationEngine,
     dbus_address: Annotated[
-        str, Field(description="Session bus address; empty = $DBUS_SESSION_BUS_ADDRESS.")
+        str,
+        Field(
+            description="Session bus address; empty = $DBUS_SESSION_BUS_ADDRESS, "
+            "else $XDG_RUNTIME_DIR/bus."
+        ),
     ] = "",
     wayland_display: Annotated[
-        str, Field(description="Socket name or path; empty = $WAYLAND_DISPLAY.")
+        str,
+        Field(
+            description="Socket name or path; empty = $WAYLAND_DISPLAY, else the running desktop's."
+        ),
     ] = "",
     enable_accessibility: Annotated[
         bool,
@@ -614,7 +627,7 @@ def session_connect(
     ] = False,
     retention: Annotated[Retention, Field(description=_RETENTION_DESCRIPTION)] = NO_RETENTION,
 ) -> SessionInfo:
-    """Attach to an already running KWin session (the real desktop or a container). Actions then affect real applications; window_close asks the user first."""  # noqa: E501
+    """Attach to an already running KWin or Hyprland session (the real desktop or a container). Actions then affect real applications; window_close asks the user first."""  # noqa: E501
     return engine.session_connect(
         dbus_address=dbus_address,
         wayland_display=wayland_display,

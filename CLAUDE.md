@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-kwin-mcp is an MCP (Model Context Protocol) server for Linux desktop GUI automation on KDE Plasma 6 Wayland.
+kwin-mcp is an MCP (Model Context Protocol) server for Linux desktop GUI automation on KDE Plasma 6 and Hyprland (including Omarchy) Wayland.
 **Purpose**: Enable AI agents (Claude Code and other MCP clients) to launch, interact with, and observe any Wayland application — either in a fully isolated virtual KWin session for reproducible GUI testing, or by connecting to a live KDE Plasma desktop (real session or container) for collaborative live desktop automation workflows.
 
 ## Toolchain
@@ -40,8 +40,11 @@ Key modules in `src/kwin_mcp/`:
 - `core.py`: `AutomationEngine` — MCP-independent automation logic for all 29 tools
 - `server.py`: Thin MCP wrappers delegating to `AutomationEngine`
 - `cli.py`: Interactive REPL + pipe mode via `cmd.Cmd` (`kwin-mcp-cli` entry point)
-- `session.py`: Virtual sessions (`dbus-run-session` + `kwin_wayland --virtual`) and live session attachment (`session_connect` to real desktop or container)
-- `screenshot.py`: KWin ScreenShot2 D-Bus, Spectacle, and X11/scrot capture
+- `session.py`: Virtual sessions (`dbus-run-session` + `kwin_wayland --virtual`, or Hyprland nested in a headless host) and live session attachment (`session_connect` to real desktop or container)
+- `compositor.py`: Which compositor (KWin or Hyprland) a session drives; carried to helper subprocesses via env
+- `hyprland.py`: Hyprland IPC: windows, workspaces, outputs, dispatchers (Lua and legacy syntax)
+- `wayland_input.py`: Hyprland input via `zwlr_virtual_pointer_v1` + `zwp_virtual_keyboard_v1`
+- `screenshot.py`: KWin ScreenShot2 D-Bus, Spectacle, X11/scrot, and grim (Hyprland) capture
 - `accessibility.py`: AT-SPI2 widget queries, element refs, and actions
 - `spoken_name.py`: Unicode normalization and spoken accessible-name matching
 - `geometry.py`: Windows, virtual desktops, activation, and output topology via KWin scripting

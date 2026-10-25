@@ -40,6 +40,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
 
+from kwin_mcp import compositor
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -540,12 +542,17 @@ def run_kwin_script(js_source: str, timeout: float = 5.0) -> str:
 
 
 def collect_windows(timeout: float = 5.0) -> list[KWinWindow]:
-    """Ask KWin for every window in-process.
+    """Ask the session's compositor for every window in-process.
 
     Keeps popups, unmanaged, deleted and every other kind: the accessibility
     mapper needs the full list to prove that an AT-SPI top-level matches
-    exactly one compositor window.
+    exactly one compositor window. A Hyprland session (see ``compositor``)
+    answers over its IPC socket with records of the same shape.
     """
+    if compositor.from_env().is_hyprland:
+        from kwin_mcp import hyprland
+
+        return hyprland.collect_windows()
     return _parse_windows(run_kwin_script(_SCRIPT_TEMPLATE, timeout))
 
 
@@ -874,8 +881,46 @@ def _optional_int(request: Mapping[str, object], key: str) -> int | None:
     return value
 
 
+def _dispatch_hyprland(request: Mapping[str, object]) -> object:
+    """Run one geometry op against Hyprland; payloads match the KWin ops exactly."""
+    from kwin_mcp import hyprland
+
+    op = request.get("op")
+    window_id = str(request.get("window_id", ""))
+    if op == "windows":
+        return hyprland.windows()
+    if op == "activate":
+        return hyprland.activate(window_id)
+    if op == "set_geometry":
+        return hyprland.set_geometry(
+            window_id=window_id,
+            x=_optional_int(request, "x"),
+            y=_optional_int(request, "y"),
+            width=_optional_int(request, "width"),
+            height=_optional_int(request, "height"),
+        )
+    if op == "desktops":
+        return hyprland.desktops(window_id=window_id)
+    if op == "set_desktop":
+        return hyprland.set_desktop(
+            window_id=window_id,
+            desktop_id=str(request.get("desktop_id", "")),
+            check_only=request.get("check_only") is True,
+        )
+    if op == "close":
+        return hyprland.close(window_id)
+    if op == "active_class":
+        return hyprland.active_class()
+    if op == "outputs":
+        return hyprland.outputs()
+    msg = f"Unknown geometry op: {op!r}"
+    raise ValueError(msg)
+
+
 def _dispatch(request: Mapping[str, object]) -> object:
     """Run the operation named by ``request["op"]`` and return its result."""
+    if compositor.from_env().is_hyprland:
+        return _dispatch_hyprland(request)
     op = request.get("op")
     window_id = str(request.get("window_id", ""))
     if op == "windows":
@@ -910,17 +955,21 @@ def _dispatch(request: Mapping[str, object]) -> object:
 
 def main() -> None:
     """Entry point for `python -m kwin_mcp.geometry`: one JSON request on stdin."""
-    import dbus
-
     try:
         request = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
         request = {}
     if not isinstance(request, dict):
         request = {}
+    # A Hyprland session needs no D-Bus at all; keep dbus-python out of its helper.
+    errors: tuple[type[Exception], ...] = (RuntimeError, ValueError)
+    if not compositor.from_env().is_hyprland:
+        import dbus
+
+        errors = (*errors, dbus.DBusException)
     try:
         print(json.dumps({"ok": True, "result": _dispatch(request)}))
-    except (RuntimeError, ValueError, dbus.DBusException) as exc:
+    except errors as exc:
         print(json.dumps({"ok": False, "error": str(exc)}))
 
 

@@ -36,6 +36,10 @@ Backends deliver different pixel spaces, verified against upstream sources:
   starts (issue #67).
 - ``scrot`` on a nested X11 display captures the X root, where each KWin
   output is an X window of ``logical size * scale`` physical pixels.
+- ``grim`` (the Hyprland backend, over ``wlr-screencopy``) composites every
+  output into one canvas of the outputs' logical bounding box times the
+  greatest output scale, each output drawn at ``(logicalXY - union top-left)
+  * scale``. Hyprland sessions use it alone; the KWin backends are skipped.
 
 Every capture is bracketed by a topology observation immediately before and
 immediately after the pixels are taken. Only an identical observation proves
@@ -61,12 +65,13 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import dbus
 import dbus.bus
 
 from kwin_mcp import progress
+from kwin_mcp.compositor import KWIN, CompositorTarget
 from kwin_mcp.models import Frame, ImageMapping, Point
 
 if TYPE_CHECKING:
@@ -197,13 +202,22 @@ def _unavailable(backend: str, reason: str) -> FrameMapping:
 # ── Topology ─────────────────────────────────────────────────────────────
 
 
-def query_topology(dbus_address: str) -> WorkspaceTopology:
+def query_topology(dbus_address: str, target: CompositorTarget = KWIN) -> WorkspaceTopology:
     """Read KWin's output layout via the geometry helper subprocess.
 
     The helper runs in its own process for the same reason ``window_geometry``
     does: KWin answers through a D-Bus callback that needs a GLib main-context
-    iteration, which must not happen inside the server process.
+    iteration, which must not happen inside the server process. A Hyprland
+    session answers over a plain IPC socket, so it is asked in-process.
     """
+    if target.is_hyprland:
+        from kwin_mcp import hyprland
+
+        try:
+            return _parse_topology(cast("_TopologyPayload", hyprland.outputs(target)))
+        except hyprland.HyprlandError as exc:
+            msg = f"Hyprland output topology unavailable: {exc}"
+            raise RuntimeError(msg) from exc
     env = {**os.environ}
     if dbus_address:
         env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
@@ -1048,6 +1062,7 @@ def capture_screenshot_to_file(
     *,
     include_cursor: bool = False,
     output_dir: Path | None = None,
+    target: CompositorTarget = KWIN,
 ) -> tuple[Path, FrameMapping]:
     """Capture a logical-space screenshot and save it to a file.
 
@@ -1061,6 +1076,7 @@ def capture_screenshot_to_file(
         wayland_socket: Wayland socket name for the isolated session.
         include_cursor: Whether to include the mouse cursor.
         output_dir: Directory to save the screenshot. Uses /tmp if not specified.
+        target: The session's compositor; Hyprland is captured with grim.
 
     Returns:
         The saved PNG path and its logical coordinate mapping.
@@ -1076,7 +1092,7 @@ def capture_screenshot_to_file(
     with tempfile.TemporaryDirectory(prefix=".capture-", dir=output_dir) as private_dir:
         private = Path(private_dir) / "capture.png"
         _, mapping = _capture_screenshot_file(
-            dbus_address, wayland_socket, private, include_cursor=include_cursor
+            dbus_address, wayland_socket, private, include_cursor=include_cursor, target=target
         )
         return _publish(private, output_dir, stem), mapping
 
@@ -1106,7 +1122,12 @@ def _capture_screenshot_file(
     output_path: Path,
     *,
     include_cursor: bool,
+    target: CompositorTarget = KWIN,
 ) -> tuple[Path, FrameMapping]:
+    if target.is_hyprland:
+        return output_path, _capture_grim_file(
+            target, wayland_socket, output_path, include_cursor=include_cursor
+        )
     x11_enabled = os.environ.get("KWIN_MCP_X11_SCREENSHOT") == "1"
     x11_selected = x11_enabled and bool(os.environ.get("DISPLAY"))
     x11_error: RuntimeError | None = None
@@ -1403,6 +1424,7 @@ def capture_frame_burst(
     region: tuple[int, int, int, int] | None = None,
     max_edge: int = 0,
     wayland_socket: str = "",
+    target: CompositorTarget = KWIN,
 ) -> list[tuple[int, Path, FrameMapping]]:
     """Capture logical-space screenshots at delays after an action ends.
 
@@ -1430,6 +1452,7 @@ def capture_frame_burst(
         max_edge: Downscale every frame so its longer side is at most this
             many pixels; ``0`` keeps full resolution.
         wayland_socket: Wayland socket name (needed for spectacle fallback).
+        target: The session's compositor; Hyprland is captured with grim.
 
     Returns:
         ``(delay_ms, path, mapping)`` per captured frame, ordered by delay.
@@ -1471,6 +1494,7 @@ def capture_frame_burst(
             include_cursor=include_cursor,
             start_time=burst_start,
             on_frame=on_frame,
+            target=target,
         )
         # Outside the backend fallback chain: a frame that cannot be reframed
         # (a region outside the workspace, or a region on an unproven mapping)
@@ -1495,8 +1519,19 @@ def _capture_burst_frames(
     include_cursor: bool,
     start_time: float,
     on_frame: Callable[[int, int], None],
+    target: CompositorTarget = KWIN,
 ) -> list[tuple[Path, FrameMapping]]:
     """Run the backend chain for a burst; returns the private ``(path, mapping)`` frames."""
+    if target.is_hyprland:
+        return _capture_frame_burst_grim(
+            target,
+            wayland_socket,
+            attempt_dir(),
+            sorted_delays,
+            include_cursor=include_cursor,
+            start_time=start_time,
+            on_frame=on_frame,
+        )
     x11_enabled = os.environ.get("KWIN_MCP_X11_SCREENSHOT") == "1"
     x11_selected = x11_enabled and bool(os.environ.get("DISPLAY"))
     x11_error: RuntimeError | None = None
@@ -1708,6 +1743,150 @@ def _capture_frame_burst_x11(
         if on_frame is not None:
             on_frame(i, delay_ms)
     return frames
+
+
+# ── Hyprland (grim) ──────────────────────────────────────────────────────
+
+
+def _grim_layout(
+    image_size: tuple[int, int], topology: WorkspaceTopology
+) -> tuple[list[_Placement], list[tuple[float, float, float, float]], str] | None:
+    """Locate each output in grim's composite, or None when the size does not fit.
+
+    grim renders the outputs' logical bounding box at the greatest output
+    scale, every output at its logical offset from the box's top-left.
+    """
+    vx, vy, vw, vh = _union(topology.outputs)
+    scale = max(output.scale for output in topology.outputs)
+    if not _close(image_size, (vw * scale, vh * scale)):
+        return None
+    placements: list[_Placement] = []
+    extents: list[tuple[float, float, float, float]] = []
+    for output in topology.outputs:
+        box = (
+            round((output.x - vx) * scale),
+            round((output.y - vy) * scale),
+            round((output.x + output.width - vx) * scale),
+            round((output.y + output.height - vy) * scale),
+        )
+        extent = (output.x, output.y, output.width, output.height)
+        placements.append(_Placement(box=box, logical=extent))
+        extents.append(extent)
+    source = f"normalized from {image_size[0]}x{image_size[1]} grim pixels; scale {scale:g}"
+    return placements, extents, source
+
+
+def _normalize_grim(path: Path, topology: WorkspaceTopology) -> FrameMapping | None:
+    layout = _grim_layout(_image_size(path), topology)
+    if layout is None:
+        return None
+    return _normalize_file(path, "grim", layout, topology)
+
+
+def _grim_mismatch(path: Path, topology: WorkspaceTopology) -> str:
+    width, height = _image_size(path)
+    _, _, vw, vh = _union(topology.outputs)
+    scale = max(output.scale for output in topology.outputs)
+    return (
+        f"grim image is {width}x{height}, expected {vw * scale:g}x{vh * scale:g} "
+        f"(outputs' bounding box at scale {scale:g})"
+    )
+
+
+def _capture_grim_file(
+    target: CompositorTarget, wayland_socket: str, output_path: Path, *, include_cursor: bool
+) -> FrameMapping:
+    topology, _ = _capture_with_state(
+        lambda: query_topology("", target),
+        lambda _: _capture_via_grim(
+            target, wayland_socket, output_path, include_cursor=include_cursor
+        ),
+    )
+    mapping = _normalize_grim(output_path, topology)
+    if mapping is None:
+        mismatch = _grim_mismatch(output_path, topology)
+        output_path.unlink(missing_ok=True)
+        msg = f"{mismatch}; coordinate mapping cannot be proven"
+        raise RuntimeError(msg)
+    return mapping
+
+
+def _capture_frame_burst_grim(
+    target: CompositorTarget,
+    wayland_socket: str,
+    private_dir: Path,
+    sorted_delays: list[int],
+    *,
+    include_cursor: bool = False,
+    start_time: float | None = None,
+    on_frame: Callable[[int, int], None] | None = None,
+) -> list[tuple[Path, FrameMapping]]:
+    """Capture frames into ``private_dir`` with grim (the Hyprland backend)."""
+    frames: list[tuple[Path, FrameMapping]] = []
+    start = time.monotonic() if start_time is None else start_time
+    for i, delay_ms in enumerate(sorted_delays):
+        target_time = start + delay_ms / 1000.0
+        now = time.monotonic()
+        if now < target_time:
+            time.sleep(target_time - now)
+
+        frame_path = private_dir / f"frame_{i:03d}.png"
+        mapping, _ = _burst_frame(
+            lambda: query_topology("", target),
+            lambda _, path=frame_path: _capture_via_grim(
+                target, wayland_socket, path, include_cursor=include_cursor
+            ),
+            lambda topology, _, path=frame_path: (
+                _normalize_grim(path, topology)
+                or _unavailable("grim", _grim_mismatch(path, topology))
+            ),
+            "grim",
+            "output topology changed while this frame was captured",
+        )
+        frames.append((frame_path, mapping))
+        if on_frame is not None:
+            on_frame(i, delay_ms)
+    return frames
+
+
+def _capture_via_grim(
+    target: CompositorTarget, wayland_socket: str, output_path: Path, *, include_cursor: bool
+) -> None:
+    """Capture every output of the session's compositor with ``grim``."""
+    output_path.unlink(missing_ok=True)
+    cmd = ["grim", "-t", "png", "-l", "1"]
+    if include_cursor:
+        cmd.append("-c")
+    cmd.append(str(output_path))
+    env = {**os.environ, **target.env()}
+    if wayland_socket:
+        env["WAYLAND_DISPLAY"] = wayland_socket
+    env.pop("DISPLAY", None)
+    try:
+        result = subprocess.run(
+            cmd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=_SUBPROCESS_CAPTURE_TIMEOUT_S,
+            check=False,
+        )
+    except FileNotFoundError:
+        msg = (
+            "grim not found. Install grim (e.g. 'sudo pacman -S grim' or 'sudo apt install grim')."
+        )
+        raise RuntimeError(msg) from None
+    except subprocess.TimeoutExpired:
+        msg = f"grim timed out after {_SUBPROCESS_CAPTURE_TIMEOUT_S:g}s"
+        raise RuntimeError(msg) from None
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace").strip()
+        detail = f": {stderr}" if stderr else ""
+        msg = f"grim failed (exit {result.returncode}){detail}"
+        raise RuntimeError(msg)
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        msg = "grim produced no output"
+        raise RuntimeError(msg)
 
 
 def _capture_via_scrot(output_path: Path, *, include_cursor: bool = False) -> None:
