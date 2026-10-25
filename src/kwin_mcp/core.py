@@ -126,8 +126,7 @@ NO_SESSION_TEXT = (
     "No session running.\nCall session_start (virtual) or session_connect (live desktop)."
 )
 NO_INPUT_TEXT = (
-    "No input backend (KWin EIS or Hyprland virtual input unavailable); "
-    "install kwin-common (KWin) or reconnect.\n"
+    "No input backend (KWin EIS unavailable); install kwin-common or reconnect.\n"
     "Call session_stop, then session_start or session_connect again."
 )
 NO_CLIPBOARD_TEXT = (
