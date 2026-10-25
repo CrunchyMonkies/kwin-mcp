@@ -1083,6 +1083,11 @@ _CTRL_SHIFT_V_TERMINALS = frozenset(
         "xfce4-terminal",
     }
 )
+# Omarchy opens its TUIs (btop, the agent, installed TUIs) through
+# xdg-terminal-exec with their own app id, org.omarchy.<name> or TUI.float /
+# TUI.tile, so the window class names the program, not the terminal. Every
+# terminal Omarchy ships (Alacritty, Ghostty, Kitty) pastes on Ctrl+Shift+V.
+_CTRL_SHIFT_V_PREFIXES = ("org.omarchy.", "tui.")
 _UNPASTEABLE_TERMINAL_MARKERS = ("term", "rxvt")
 
 
@@ -1097,7 +1102,7 @@ def paste_chord(resource_class: str | None) -> str | None:
     if resource_class is None:
         return None
     cls = resource_class.lower()
-    if cls in _CTRL_SHIFT_V_TERMINALS:
+    if cls in _CTRL_SHIFT_V_TERMINALS or cls.startswith(_CTRL_SHIFT_V_PREFIXES):
         return "ctrl+shift+v"
     if any(marker in cls for marker in _UNPASTEABLE_TERMINAL_MARKERS):
         return None

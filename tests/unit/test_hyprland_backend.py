@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import subprocess
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from kwin_mcp import compositor, geometry, hyprland, screenshot
+from kwin_mcp import compositor, geometry, hyprland, screenshot, session
 from kwin_mcp.compositor import CompositorTarget
+from kwin_mcp.input import paste_chord
+from kwin_mcp.models import ScreenSize, SessionInfo
 from kwin_mcp.screenshot import OutputGeometry, WorkspaceTopology
 
 if TYPE_CHECKING:
@@ -147,6 +151,63 @@ def test_detect_live_finds_the_instance_serving_the_socket(tmp_path: Path) -> No
     assert compositor.detect_live(env, str(tmp_path / "wayland-2")).hyprland_signature == "other"
     assert compositor.detect_live(env, "wayland-9") == compositor.KWIN
     assert compositor.detect_live(env) == compositor.KWIN
+
+
+def _listen(path: Path) -> socket.socket:
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen()
+    return server
+
+
+def _lock(base: Path, signature: str, pid: int, socket_name: str) -> None:
+    lock = base / "hypr" / signature / "hyprland.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(f"{pid}\n{socket_name}\n")
+
+
+def test_discovery_prefers_the_login_hyprland_over_virtual_ones(tmp_path: Path) -> None:
+    env = {"XDG_RUNTIME_DIR": str(tmp_path)}
+    servers = [_listen(tmp_path / name) for name in ("wayland-0", "wayland-1", "wayland-2")]
+    # A kwin-mcp virtual Hyprland: started with the marker in its environment.
+    virtual = subprocess.Popen(
+        ["sleep", "30"], env={**os.environ, "AQ_DRM_DEVICES": "/nonexistent"}
+    )
+    try:
+        _lock(tmp_path, "h_100_a", virtual.pid, "wayland-2")
+        _lock(tmp_path, "h_300_b", os.getpid(), "wayland-0")
+        _lock(tmp_path, "h_200_c", os.getpid(), "wayland-1")
+        assert compositor.discover_live_display(env) == "wayland-1"
+        signature_env = {**env, "HYPRLAND_INSTANCE_SIGNATURE": "h_300_b"}
+        assert compositor.discover_live_display(signature_env) == "wayland-0"
+    finally:
+        virtual.kill()
+        virtual.wait()
+        for server in servers:
+            server.close()
+
+
+def test_discovery_falls_back_to_the_lowest_live_wayland_socket(tmp_path: Path) -> None:
+    env = {"XDG_RUNTIME_DIR": str(tmp_path)}
+    assert compositor.discover_live_display(env) == ""
+    stale = _listen(tmp_path / "wayland-0")
+    stale.close()  # the file stays, nothing accepts
+    servers = [_listen(tmp_path / name) for name in ("wayland-mcp-1", "wayland-10", "wayland-2")]
+    try:
+        assert compositor.discover_live_display(env) == "wayland-2"
+    finally:
+        for server in servers:
+            server.close()
+
+
+def test_discovery_finds_the_user_bus(tmp_path: Path) -> None:
+    env = {"XDG_RUNTIME_DIR": str(tmp_path)}
+    assert compositor.discover_session_bus(env) == ""
+    bus = _listen(tmp_path / "bus")
+    try:
+        assert compositor.discover_session_bus(env) == f"unix:path={tmp_path}/bus"
+    finally:
+        bus.close()
 
 
 def test_request_without_signature_fails_clearly() -> None:
@@ -325,6 +386,21 @@ def test_topology_parses_hyprland_outputs(fake: FakeHyprland) -> None:
 # ── Input ────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("app_class", "chord"),
+    [
+        ("org.omarchy.btop", "ctrl+shift+v"),
+        ("org.omarchy.terminal", "ctrl+shift+v"),
+        ("TUI.float", "ctrl+shift+v"),
+        ("Alacritty", "ctrl+shift+v"),
+        ("com.mitchellh.ghostty", "ctrl+shift+v"),
+        ("chromium", "ctrl+v"),
+    ],
+)
+def test_omarchy_terminals_paste_on_ctrl_shift_v(app_class: str, chord: str) -> None:
+    assert paste_chord(app_class) == chord
+
+
 def test_discrete_scroll_converts_120ths_to_detents(monkeypatch: pytest.MonkeyPatch) -> None:
     from kwin_mcp import wayland_input
 
@@ -344,3 +420,69 @@ def test_discrete_scroll_converts_120ths_to_detents(monkeypatch: pytest.MonkeyPa
 
 
 # ── Virtual session ──────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(("version", "suffix"), [((0, 56), ".lua"), ((0, 50), ".conf")])
+def test_hyprland_config_matches_the_installed_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: tuple[int, int],
+    suffix: str,
+) -> None:
+    monkeypatch.setattr(session.shutil, "which", lambda _name: "/usr/bin/Hyprland")
+    monkeypatch.setattr(session, "_hyprland_version", lambda: version)
+    path = session.write_hyprland_config(tmp_path, 1280, 800)
+    assert path.suffix == suffix
+    text = path.read_text()
+    assert "1280x800@60" in text
+    assert "follow_mouse" in text
+    assert "xwayland" in text
+
+
+def test_virtual_hyprland_requires_a_kwin_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(session.shutil, "which", lambda _name: None)
+    with pytest.raises(RuntimeError, match="kwin_wayland --virtual"):
+        session.require_hyprland_host()
+
+
+def test_hyprland_wrapper_keeps_hyprland_off_the_real_seat(tmp_path: Path) -> None:
+    virtual = session.Session()
+    virtual._socket_name = "wayland-mcp-1"
+    virtual._host_socket = "wayland-mcp-1-host"
+    virtual._hyprland_config = tmp_path / "hypr" / "kwin-mcp.lua"
+    config = session.SessionConfig(screen_width=1280, screen_height=800, compositor="hyprland")
+    script = virtual._build_wrapper_script(config)
+    assert "kwin_wayland --virtual" in script
+    assert "--socket wayland-mcp-1-host" in script
+    assert "AQ_DRM_DEVICES=/nonexistent LIBSEAT_BACKEND=noop" in script
+    assert f"Hyprland --config {tmp_path}/hypr/kwin-mcp.lua" in script
+    assert 'echo "HYPRLAND_INSTANCE_SIGNATURE=$HYPR_SIGNATURE"' in script
+    assert "HOST_PID=\n" in script
+    assert "kill $KWIN_PID $HOST_PID" in script
+    assert script.index('echo "WAYLAND_DISPLAY=$HYPR_SOCKET"') < script.index('echo "READY"')
+    # The KWin path is unchanged by the Hyprland split.
+    kwin_script = virtual._build_wrapper_script(session.SessionConfig())
+    assert "Hyprland --config" not in kwin_script
+    assert "AQ_DRM_DEVICES" not in kwin_script
+    assert "kwin_wayland --virtual --no-lockscreen" in kwin_script
+
+
+def test_session_info_names_the_compositor() -> None:
+    info = SessionInfo(
+        kind="live",
+        wayland_socket="wayland-1",
+        dbus_address="unix:path=/run/user/1/bus",
+        screen=ScreenSize(width=1920, height=1080),
+        artifacts_dir="/tmp/a",
+        input_backend="virtual",
+        clipboard=True,
+        accessibility="on",
+        compositor="hyprland",
+    )
+    text = info.render()
+    assert text.startswith("Connected to live Hyprland session.")
+    assert "Compositor: Hyprland" in text
+    assert "Input backend: Wayland virtual pointer/keyboard (no touch)" in text
+    kwin = info.model_copy(update={"compositor": "kwin", "input_backend": "eis"}).render()
+    assert kwin.startswith("Connected to live KWin session.")
+    assert "Compositor:" not in kwin

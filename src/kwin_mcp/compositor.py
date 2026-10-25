@@ -13,7 +13,11 @@ it on every window query.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import re
+import socket
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -132,3 +136,98 @@ def detect_live(
         hyprland_signature=signature,
         runtime_dir=runtime_dir,
     )
+
+
+# ── Finding the running desktop ──────────────────────────────────────────
+
+# kwin-mcp's own virtual Hyprland sessions run with this in their environment
+# (see session._hyprland_block); they are never the user's desktop.
+_VIRTUAL_HYPRLAND_MARKER = b"AQ_DRM_DEVICES=/nonexistent"
+_WAYLAND_SOCKET = re.compile(r"^wayland-(\d+)$")
+
+
+def runtime_dir(env: Mapping[str, str] | None = None) -> str:
+    """``$XDG_RUNTIME_DIR``, or the systemd default for this user."""
+    source = os.environ if env is None else env
+    return source.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+
+
+def _hyprland_desktops(base: str) -> list[tuple[str, str]]:
+    """``(signature, socket)`` of every running Hyprland that is not kwin-mcp's, oldest first.
+
+    The signature embeds the instance's start time (``<hash>_<time>_<random>``),
+    so the oldest instance is the one the login session started.
+    """
+    found: list[tuple[int, str, str]] = []
+    try:
+        locks = list(hyprland_instance_dir(base, "").glob("*/hyprland.lock"))
+    except OSError:
+        return []
+    for lock in locks:
+        try:
+            pid, socket_name = (line.strip() for line in lock.read_text().splitlines()[:2])
+        except (OSError, ValueError):
+            continue
+        if not pid.isdigit() or not Path(f"/proc/{pid}").exists():
+            continue
+        with contextlib.suppress(OSError):
+            if _VIRTUAL_HYPRLAND_MARKER in Path(f"/proc/{pid}/environ").read_bytes():
+                continue
+        parts = lock.parent.name.split("_")
+        started = int(parts[1]) if len(parts) > 2 and parts[1].isdigit() else 0
+        found.append((started, lock.parent.name, socket_name))
+    return [(signature, socket_name) for _, signature, socket_name in sorted(found)]
+
+
+def _accepts_connections(path: Path) -> bool:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            probe.connect(str(path))
+    except OSError:
+        return False
+    return True
+
+
+def discover_live_display(env: Mapping[str, str] | None = None) -> str:
+    """The Wayland socket of the running desktop, for a server started outside it; or "".
+
+    Used only when neither ``wayland_display`` nor ``$WAYLAND_DISPLAY`` names
+    one (an MCP server launched by a service or an IDE backend). In order: the
+    Hyprland named by ``$HYPRLAND_INSTANCE_SIGNATURE``; the oldest running
+    Hyprland that is not a kwin-mcp virtual session; the lowest-numbered
+    ``wayland-N`` socket that accepts connections (KWin and every other
+    compositor). kwin-mcp's own virtual KWin sockets are named
+    ``wayland-mcp-*`` and never match.
+    """
+    source = os.environ if env is None else env
+    base = runtime_dir(source)
+    signature = source.get(HYPRLAND_SIGNATURE_ENV, "")
+    if signature and "/" not in signature:
+        with contextlib.suppress(OSError, IndexError):
+            lines = (hyprland_instance_dir(base, signature) / "hyprland.lock").read_text()
+            socket_name = lines.splitlines()[1].strip()
+            if socket_name:
+                return socket_name
+    for _, socket_name in _hyprland_desktops(base):
+        if _accepts_connections(Path(base) / socket_name):
+            return socket_name
+    try:
+        names = [p.name for p in Path(base).iterdir() if _WAYLAND_SOCKET.match(p.name)]
+    except OSError:
+        return ""
+    for name in sorted(names, key=lambda n: int(n.split("-")[1])):
+        path = Path(base) / name
+        with contextlib.suppress(OSError):
+            if stat.S_ISSOCK(path.stat().st_mode) and _accepts_connections(path):
+                return name
+    return ""
+
+
+def discover_session_bus(env: Mapping[str, str] | None = None) -> str:
+    """``unix:path=$XDG_RUNTIME_DIR/bus`` when that socket exists (systemd's user bus); or ""."""
+    path = Path(runtime_dir(env)) / "bus"
+    with contextlib.suppress(OSError):
+        if stat.S_ISSOCK(path.stat().st_mode):
+            return f"unix:path={path}"
+    return ""

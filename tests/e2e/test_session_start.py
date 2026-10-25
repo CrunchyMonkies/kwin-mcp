@@ -241,6 +241,7 @@ def test_session_start_has_no_app_command_parameter() -> None:
         "enable_clipboard",
         "home",
         "retention",
+        "compositor",
     ]
 
 
